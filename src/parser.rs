@@ -1,4 +1,3 @@
-use ark_ec::AffineRepr;
 use nom::{
     IResult, Parser,
     branch::alt,
