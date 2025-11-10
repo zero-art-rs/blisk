@@ -1,7 +1,9 @@
 use ark_ec::AffineRepr;
+use itertools::Itertools;
 use std::cmp::Ordering;
 use std::fmt::{self, Display};
 use std::hash::{Hash, Hasher};
+use std::ops::Add;
 use tree_ds::prelude::{Node, Tree};
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -35,7 +37,7 @@ pub struct PolicyTree<G: AffineRepr>(pub(crate) Tree<u64, PolicyNode<G>>);
 
 impl<G: AffineRepr> PolicyTree<G> {
     pub fn new(tree: Tree<u64, PolicyNode<G>>) -> Self {
-        Self(tree)
+        Self(tree).resolve_and_gates()
     }
 
     /// get a list of needed users labels to resolve the policy (build the tree completely)
@@ -44,16 +46,127 @@ impl<G: AffineRepr> PolicyTree<G> {
         self.0
             .get_nodes()
             .iter()
-            .filter_map(|node| match node {
-                PolicyNode::OrGate(None) => node
-                    .get_children_ids()
-                    .map(|node_id| self.0.get_node_by_id(node_id).unwrap().get_label())
-                    .collect(),
+            .filter_map(|node| match node.get_value().unwrap().unwrap() {
+                PolicyNode::OrGate(None) => Some(
+                    node.get_children_ids()
+                        .unwrap()
+                        .iter()
+                        .filter_map(|node_id| {
+                            match self
+                                .0
+                                .get_node_by_id(node_id)
+                                .unwrap()
+                                .get_value()
+                                .unwrap()
+                                .unwrap()
+                            {
+                                PolicyNode::UserKey(u) => Some(u.0),
+                                _ => None,
+                            }
+                        })
+                        .collect::<Vec<_>>(),
+                ),
                 _ => None,
             })
             .flatten()
+            .sorted()
+            .dedup()
             .collect()
     }
+
+    /// Checks if the policy tree is resolved (i.e. all nodes have values)
+    pub fn is_resolved(&self) -> bool {
+        self.0
+            .get_root_node()
+            .unwrap()
+            .get_value()
+            .unwrap()
+            .is_some()
+    }
+
+    fn resolve_and_gate(&self, root: &mut Node<u64, PolicyNode<G>>) -> Option<G> {
+        match root.get_value().unwrap().unwrap() {
+            PolicyNode::UserKey((_, u)) => Some(u),
+            PolicyNode::OrGate(Some(u)) => Some(u),
+            PolicyNode::OrGate(None) => {
+                root.get_children_ids()
+                    .unwrap()
+                    .iter()
+                    .for_each(|child_id| {
+                        self.resolve_and_gate(&mut self.0.get_node_by_id(&child_id).unwrap());
+                    });
+                None
+            }
+
+            PolicyNode::AndGate(Some(u)) => Some(u),
+            PolicyNode::AndGate(None) => {
+                let res = root
+                    .get_children_ids()
+                    .unwrap()
+                    .iter()
+                    .map(|x| self.resolve_and_gate(&mut self.0.get_node_by_id(x).unwrap()))
+                    .fold_options(G::ZERO, |acc, x| (acc + x).into());
+                root.update_value(|v| *v = Some(PolicyNode::AndGate(res)))
+                    .unwrap();
+                res
+            }
+            _ => None,
+        }
+    }
+
+    fn resolve_and_gates(self) -> Self {
+        self.resolve_and_gate(&mut self.0.get_root_node().unwrap());
+        self
+        /*for node in self.0.get_nodes().iter() {
+            match node.get_value().unwrap().unwrap() {
+                PolicyNode::AndGate(_) => {
+                    if node.get_children_ids().unwrap().iter().all(|child_id| {
+                        match self
+                            .0
+                            .get_node_by_id(child_id)
+                            .unwrap()
+                            .get_value()
+                            .unwrap()
+                            .unwrap()
+                        {
+                            PolicyNode::UserKey(_) => true,
+                            PolicyNode::AndGate(Some(_)) => true,
+                            PolicyNode::OrGate(Some(_)) => true,
+                            _ => false,
+                        }
+                    }) {
+                        node.set_value(Some(PolicyNode::AndGate(Some(
+                            node.get_children_ids()
+                                .unwrap()
+                                .iter()
+                                .map(|child_id| {
+                                    match self
+                                        .0
+                                        .get_node_by_id(child_id)
+                                        .unwrap()
+                                        .get_value()
+                                        .unwrap()
+                                        .unwrap()
+                                    {
+                                        PolicyNode::UserKey((_, u)) => u,
+                                        PolicyNode::AndGate(Some(u)) => u,
+                                        PolicyNode::OrGate(Some(u)) => u,
+                                        _ => unreachable!(),
+                                    }
+                                })
+                                .fold(G::ZERO, |acc, x| (acc + x).into()),
+                        ))))
+                        .unwrap();
+                    }
+                }
+                _ => continue,
+            }
+        }
+        self*/
+    }
+
+    /// Resolve the user's keys in the policy tree
+    pub fn resolve(self, key: G::ScalarField) -> Self {}
 }
 
 impl<G: AffineRepr> Display for PolicyTree<G> {

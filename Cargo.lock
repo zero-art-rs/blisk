@@ -163,6 +163,7 @@ dependencies = [
  "ark-ed25519",
  "ark-ff",
  "ark-serialize",
+ "itertools",
  "nom",
  "thiserror",
  "tree-ds",
