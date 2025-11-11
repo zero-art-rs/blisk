@@ -6,8 +6,18 @@ use crate::{
     policy::{PolicyNode, PolicyTree},
 };
 use ark_ec::AffineRepr;
+use ark_ff::{BigInt, BigInteger, Field, PrimeField, UniformRand};
 use std::result::Result;
 use tree_ds::prelude::*;
+
+impl PolicyExpr {
+    pub(crate) fn generate_random_keys<G: AffineRepr>(
+        &self,
+    ) -> Result<(HashMap<String, G>, HashMap<String, G::ScalarField>), PolicyError> {
+       
+        
+    }
+}
 
 pub struct Compiler {}
 
@@ -20,6 +30,7 @@ impl Compiler {
         &self,
         ast: &PolicyExpr,
         public_keys: HashMap<String, G>, // map from labels to public keys
+        iota: fn(G) -> G::ScalarField,
     ) -> Result<PolicyTree<G>, PolicyError> {
         let mut idx = 0;
         // Helper function to recursively compile the AST
@@ -94,97 +105,103 @@ impl Compiler {
             }
         }
 
-        compile_inner(ast, &public_keys, &mut idx).map(PolicyTree::new)
+        compile_inner(ast, &public_keys, &mut idx).map(|tree| PolicyTree::new(tree, iota))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ark_bls12_381::{Fr, G1Affine};
     use ark_ec::CurveGroup;
+    use ark_ed25519::{EdwardsAffine as G1Affine, Fr};
     use std::ops::Mul;
 
-    fn setup_test_keys() -> HashMap<String, G1Affine> {
+    fn setup_test_keys() -> (HashMap<String, G1Affine>, HashMap<String, Fr>) {
         let mut public_keys = HashMap::new();
+        let mut private_keys = HashMap::new();
         // Generate some test public keys using random scalars
         for i in 1..=3 {
             let scalar = Fr::from(i as u64);
             let point = G1Affine::generator().mul(scalar).into_affine();
-            public_keys.insert(format!("key{}", i), point);
+            public_keys.insert(format!("Key {}", i), point);
+            private_keys.insert(format!("Key {}", i), scalar);
         }
-        public_keys
+        (public_keys, private_keys)
+    }
+
+    fn iota(P: G1Affine) -> Fr {
+        P.x().unwrap().into_bigint().into()
     }
 
     #[test]
     fn test_compile_single_key() {
         let compiler = Compiler::new();
-        let public_keys = setup_test_keys();
+        let (public_keys, _) = setup_test_keys();
         let expr = PolicyExpr::Key("key1".to_string());
 
-        let result = compiler.compile(&expr, public_keys.clone()).unwrap();
+        let result = compiler.compile(&expr, public_keys.clone(), iota).unwrap();
         println!("test_compile_single_key: {}", result);
     }
 
     #[test]
     fn test_compile_and_expression() {
         let compiler = Compiler::new();
-        let public_keys = setup_test_keys();
+        let (public_keys, _) = setup_test_keys();
         let expr = PolicyExpr::And(vec![
             PolicyExpr::Key("key1".to_string()),
             PolicyExpr::Key("key2".to_string()),
         ]);
 
-        let result = compiler.compile(&expr, public_keys.clone()).unwrap();
+        let result = compiler.compile(&expr, public_keys.clone(), iota).unwrap();
         println!("test_compile_and_expression: {}", result);
     }
 
     #[test]
     fn test_compile_or_expression() {
         let compiler = Compiler::new();
-        let public_keys = setup_test_keys();
+        let (public_keys, _) = setup_test_keys();
         let expr = PolicyExpr::Or(vec![
             PolicyExpr::Key("key1".to_string()),
             PolicyExpr::Key("key2".to_string()),
         ]);
 
-        let result = compiler.compile(&expr, public_keys.clone()).unwrap();
+        let result = compiler.compile(&expr, public_keys.clone(), iota).unwrap();
         println!("test_compile_or_expression: {}", result);
     }
 
     #[test]
     fn test_compile_complex_expression() {
         let compiler = Compiler::new();
-        let public_keys = setup_test_keys();
+        let (public_keys, _) = setup_test_keys();
         let expr = PolicyExpr::And(vec![
             PolicyExpr::Key("key1".to_string()),
-            PolicyExpr::Or(vec![
+            PolicyExpr::And(vec![
                 PolicyExpr::Key("key2".to_string()),
                 PolicyExpr::Key("key3".to_string()),
             ]),
         ]);
 
-        let result = compiler.compile(&expr, public_keys.clone()).unwrap();
+        let result = compiler.compile(&expr, public_keys.clone(), iota).unwrap();
         println!("test_compile_complex_expression: {}", result);
     }
 
     #[test]
     fn test_compile_invalid_key() {
         let compiler = Compiler::new();
-        let public_keys = setup_test_keys();
+        let (public_keys, _) = setup_test_keys();
         let expr = PolicyExpr::Key("nonexistent".to_string());
 
-        let result = compiler.compile(&expr, public_keys.clone());
+        let result = compiler.compile(&expr, public_keys.clone(), iota);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_compile_unimplemented_not() {
         let compiler = Compiler::new();
-        let public_keys = setup_test_keys();
+        let (public_keys, _) = setup_test_keys();
         let expr = PolicyExpr::Not(Box::new(PolicyExpr::Key("key1".to_string())));
 
-        let result = compiler.compile(&expr, public_keys.clone());
+        let result = compiler.compile(&expr, public_keys.clone(), iota);
         assert!(result.is_err());
     }
 }

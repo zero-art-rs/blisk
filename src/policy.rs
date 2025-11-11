@@ -1,13 +1,14 @@
+use crate::errors::PolicyError;
 use ark_ec::AffineRepr;
+use ark_ec::CurveGroup;
+use ark_ff::{BigInt, BigInteger, Field, PrimeField, UniformRand};
+use ark_serialize::CanonicalSerializeHashExt;
 use itertools::Itertools;
 use std::cmp::Ordering;
 use std::fmt::{self, Display};
 use std::hash::{Hash, Hasher};
 use std::ops::Add;
 use tree_ds::prelude::{Node, Tree};
-use ark_ec::CurveGroup;
-
-use crate::errors::PolicyError;
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum PolicyNode<G: AffineRepr> {
@@ -36,17 +37,20 @@ impl<G: AffineRepr> fmt::Display for PolicyNode<G> {
 }
 
 #[derive(Debug)]
-pub struct PolicyTree<G: AffineRepr>(pub(crate) Tree<u64, PolicyNode<G>>);
+pub struct PolicyTree<G: AffineRepr> {
+    pub(crate) tree: Tree<u64, PolicyNode<G>>,
+    pub(crate) iota: fn(G) -> G::ScalarField,
+}
 
 impl<G: AffineRepr> PolicyTree<G> {
-    pub fn new(tree: Tree<u64, PolicyNode<G>>) -> Self {
-        Self(tree).resolve_and_gates()
+    pub fn new(tree: Tree<u64, PolicyNode<G>>, iota: fn(G) -> G::ScalarField) -> Self {
+        Self { tree, iota }.resolve_and_gates()
     }
 
     /// get a list of needed users labels to resolve the policy (build the tree completely)
     /// typyially, resolved by OR-gates' inputs
     pub fn get_resolution_list(&self) -> Vec<String> {
-        self.0
+        self.tree
             .get_nodes()
             .iter()
             .filter_map(|node| match node.get_value().unwrap().unwrap() {
@@ -56,7 +60,7 @@ impl<G: AffineRepr> PolicyTree<G> {
                         .iter()
                         .filter_map(|node_id| {
                             match self
-                                .0
+                                .tree
                                 .get_node_by_id(node_id)
                                 .unwrap()
                                 .get_value()
@@ -79,7 +83,7 @@ impl<G: AffineRepr> PolicyTree<G> {
 
     /// Checks if the policy tree is resolved (i.e. all nodes have values)
     pub fn is_resolved(&self) -> bool {
-        self.0
+        self.tree
             .get_root_node()
             .unwrap()
             .get_value()
@@ -87,7 +91,7 @@ impl<G: AffineRepr> PolicyTree<G> {
             .is_some()
     }
 
-    fn resolve_and_gate(&self, root: &mut Node<u64, PolicyNode<G>>) -> Option<G> {
+    fn resolve_and_gate(&self, root: &Node<u64, PolicyNode<G>>) -> Option<G> {
         match root.get_value().unwrap().unwrap() {
             PolicyNode::UserKey((_, u)) => Some(u),
             PolicyNode::OrGate(Some(u)) => Some(u),
@@ -96,7 +100,7 @@ impl<G: AffineRepr> PolicyTree<G> {
                     .unwrap()
                     .iter()
                     .for_each(|child_id| {
-                        self.resolve_and_gate(&mut self.0.get_node_by_id(&child_id).unwrap());
+                        self.resolve_and_gate(&self.tree.get_node_by_id(&child_id).unwrap());
                     });
                 None
             }
@@ -107,7 +111,7 @@ impl<G: AffineRepr> PolicyTree<G> {
                     .get_children_ids()
                     .unwrap()
                     .iter()
-                    .map(|x| self.resolve_and_gate(&mut self.0.get_node_by_id(x).unwrap()))
+                    .map(|x| self.resolve_and_gate(&self.tree.get_node_by_id(x).unwrap()))
                     .fold_options(G::ZERO, |acc, x| (acc + x).into());
                 root.update_value(|v| *v = Some(PolicyNode::AndGate(res)))
                     .unwrap();
@@ -117,34 +121,67 @@ impl<G: AffineRepr> PolicyTree<G> {
         }
     }
 
-    fn resolve_or_gate(&self, root: &mut Node<u64, PolicyNode<G>>, secret_key: G::ScalarField) -> Result<(Option<G::ScalarField>, Option<G>), PolicyError> {
+    fn resolve_or_gate(
+        &self,
+        root: &Node<u64, PolicyNode<G>>,
+        secret_key: G::ScalarField,
+    ) -> Result<(Option<G::ScalarField>, Option<G>), PolicyError> {
         match root.get_value().unwrap().unwrap() {
             PolicyNode::UserKey((_, u)) => {
                 match u == (G::generator() * secret_key).into_affine() {
-                    true => Ok((Some(secret_key), Some(u))),
+                    true => Ok((Some(secret_key), Some(u))), // our leaf node
                     false => Ok((None, Some(u))),
                 }
-            },
+            }
             PolicyNode::OrGate(Some(u)) => Ok((None, Some(u))),
             PolicyNode::OrGate(None) => {
-                if root.get_children_ids()
-                    .unwrap().len() != 2 {
-                    return Err(PolicyError::ResolutionError("OR gate must have exactly 2 childs".into()));
+                if root.get_children_ids().unwrap().len() != 2 {
+                    return Err(PolicyError::ResolutionError(
+                        "OR gate must have exactly 2 childs".into(),
+                    ));
                 }
-                let left_child = self.0.get_node_by_id(&root.get_children_ids().unwrap()[0]).unwrap();
-                let right_child = self.0.get_node_by_id(&root.get_children_ids().unwrap()[1]).unwrap();
-
-                Ok((None, None))
+                let (s_a, Q_a) = self.resolve_or_gate(
+                    &self
+                        .tree
+                        .get_node_by_id(&root.get_children_ids().unwrap()[0])
+                        .unwrap(),
+                    secret_key,
+                )?;
+                let (s_b, Q_b) = self.resolve_or_gate(
+                    &self
+                        .tree
+                        .get_node_by_id(&root.get_children_ids().unwrap()[1])
+                        .unwrap(),
+                    secret_key,
+                )?;
+                if let Some(s_a) = s_a
+                    && let Some(Q_b) = Q_b
+                {
+                    let s = (self.iota)((Q_b * s_a).into_affine());
+                    let Q = (G::generator() * s).into_affine();
+                    root.update_value(|x| *x = Some(PolicyNode::OrGate(Some(Q))))
+                        .unwrap();
+                    Ok((Some(s), Some(Q)))
+                } else if let Some(s_b) = s_b
+                    && let Some(Q_a) = Q_a
+                {
+                    let s = (self.iota)((Q_a * s_b).into_affine());
+                    let Q = (G::generator() * s).into_affine();
+                    root.update_value(|x| *x = Some(PolicyNode::OrGate(Some(Q))))
+                        .unwrap();
+                    Ok((Some(s), Some(Q)))
+                } else {
+                    Ok((None, None))
+                }
             }
-
             PolicyNode::AndGate(Some(u)) => Ok((None, Some(u))),
             PolicyNode::AndGate(None) => {
-                root.get_children_ids()
-                    .unwrap()
-                    .iter()
-                    .for_each(|child_id| {
-                        self.resolve_or_gate(&mut self.0.get_node_by_id(&child_id).unwrap(), secret_key);
-                    });
+                for child_id in root.get_children_ids().unwrap() {
+                    self.resolve_or_gate(
+                        &self.tree.get_node_by_id(&child_id).unwrap(),
+                        secret_key,
+                    )?;
+                }
                 Ok((None, None))
             }
             _ => Ok((None, None)),
@@ -152,17 +189,21 @@ impl<G: AffineRepr> PolicyTree<G> {
     }
 
     fn resolve_and_gates(self) -> Self {
-        self.resolve_and_gate(&mut self.0.get_root_node().unwrap());
+        self.resolve_and_gate(&mut self.tree.get_root_node().unwrap());
         self
     }
 
     /// Resolve the user's keys in the policy tree
-    //pub fn resolve(self, key: G::ScalarField) -> Self {}
+    pub fn resolve(self, key: G::ScalarField) -> Result<Self, PolicyError> {
+        self.resolve_or_gate(&mut self.tree.get_root_node().unwrap(), key)?;
+        self.resolve_and_gate(&mut self.tree.get_root_node().unwrap());
+        Ok(self)
+    }
 }
 
 impl<G: AffineRepr> Display for PolicyTree<G> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
+        write!(f, "{}", self.tree)
     }
 }
 
@@ -177,5 +218,50 @@ impl<G: AffineRepr> Signer<G> {
             secret_key,
             public_key,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::compiler::Compiler;
+    use crate::parser::PolicyExpr;
+    use ark_ec::CurveGroup;
+    use ark_ed25519::{EdwardsAffine as G1Affine, Fr};
+    use std::collections::HashMap;
+    use std::ops::Mul;
+
+    fn iota(P: G1Affine) -> Fr {
+        Fr::from_le_bytes_mod_order(&P.x().unwrap().into_bigint().to_bytes_le())
+    }
+
+    fn setup_test_keys(k: usize) -> (HashMap<String, G1Affine>, HashMap<String, Fr>) {
+        let mut public_keys = HashMap::new();
+        let mut private_keys = HashMap::new();
+        // Generate some test public keys using random scalars
+        for i in 1..=k {
+            let scalar = Fr::from(i as u64);
+            let point = G1Affine::generator().mul(scalar).into_affine();
+            public_keys.insert(format!("Key {}", i), point);
+            private_keys.insert(format!("Key {}", i), scalar);
+        }
+        (public_keys, private_keys)
+    }
+
+    #[test]
+    fn test_resolve() {
+        let compiler = Compiler::new();
+        let (public_keys, private_keys) = setup_test_keys(3);
+        let expr = PolicyExpr::And(vec![
+            PolicyExpr::Key("Key 1".to_string()),
+            PolicyExpr::Or(vec![
+                PolicyExpr::Key("Key 2".to_string()),
+                PolicyExpr::Key("Key 3".to_string()),
+            ]),
+        ]);
+
+        let policy = compiler.compile(&expr, public_keys.clone(), iota).unwrap();
+        let resolved_policy = policy.resolve(private_keys["Key 2"]).unwrap();
+        println!("{:}", resolved_policy);
     }
 }
