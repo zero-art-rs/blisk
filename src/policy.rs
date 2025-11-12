@@ -224,8 +224,10 @@ impl<G: AffineRepr> Signer<G> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::compiler::CompilationOptions;
     use crate::compiler::Compiler;
     use crate::parser::PolicyExpr;
+    use crate::parser::parse;
     use ark_ec::CurveGroup;
     use ark_ed25519::{EdwardsAffine as G1Affine, Fr};
     use std::collections::HashMap;
@@ -249,19 +251,29 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve() {
+    fn test_resolve_cnf() {
+        let circuits = [
+            "(and A B)",
+            "(and (or A B) (or A C))",
+            "(and (or A B) C)",
+            "(and (or A (or B C)) (or B (or D C)))",
+        ];
         let compiler = Compiler::new();
-        let (public_keys, private_keys) = setup_test_keys(3);
-        let expr = PolicyExpr::And(vec![
-            PolicyExpr::Key("Key 1".to_string()),
-            PolicyExpr::Or(vec![
-                PolicyExpr::Key("Key 2".to_string()),
-                PolicyExpr::Key("Key 3".to_string()),
-            ]),
-        ]);
-
-        let policy = compiler.compile(&expr, public_keys.clone(), iota).unwrap();
-        let resolved_policy = policy.resolve(private_keys["Key 2"]).unwrap();
-        println!("{:}", resolved_policy);
+        for c in circuits {
+            let (_, expr) = parse(c).unwrap();
+            let test_keys = expr.generate_random_keys().unwrap();
+            let public_keys = test_keys
+                .iter()
+                .map(|(k, (_, pk))| (k.clone(), *pk))
+                .collect();
+            let options = CompilationOptions {
+                public_keys,
+                iota,
+                name: "Test Policy".to_string(),
+            };
+            let policy = compiler.compile(&expr, options).unwrap();
+            let resolved_policy = policy.resolve(test_keys["A"].0).unwrap();
+            println!("{:}", resolved_policy);
+        }
     }
 }

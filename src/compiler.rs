@@ -5,21 +5,72 @@ use crate::{
     parser::PolicyExpr,
     policy::{PolicyNode, PolicyTree},
 };
-use ark_ec::AffineRepr;
+use ark_ec::{AffineRepr, CurveGroup};
 use ark_ff::{BigInt, BigInteger, Field, PrimeField, UniformRand};
+use rand::Rng;
 use std::result::Result;
 use tree_ds::prelude::*;
 
 impl PolicyExpr {
     pub(crate) fn generate_random_keys<G: AffineRepr>(
         &self,
-    ) -> Result<(HashMap<String, G>, HashMap<String, G::ScalarField>), PolicyError> {
-       
-        
+    ) -> Result<HashMap<String, (G::ScalarField, G)>, PolicyError> {
+        let mut keys = HashMap::new();
+
+        fn traverse<G: AffineRepr>(
+            expr: &PolicyExpr,
+            keys: &mut HashMap<String, (G::ScalarField, G)>,
+        ) -> Result<(), PolicyError> {
+            match expr {
+                PolicyExpr::Key(label) => {
+                    if !keys.contains_key(label) {
+                        // Generate a random scalar field element (private key)
+                        let mut rng = rand::thread_rng();
+                        let private_key = G::ScalarField::rand(&mut rng);
+
+                        // Derive the public key from the private key
+                        let public_key = (G::generator() * private_key).into_affine();
+
+                        // Store the keys
+                        keys.insert(label.clone(), (private_key, public_key));
+                    }
+                    Ok(())
+                }
+                PolicyExpr::And(sub_exprs) | PolicyExpr::Or(sub_exprs) => {
+                    for sub_expr in sub_exprs {
+                        traverse(sub_expr, keys)?;
+                    }
+                    Ok(())
+                }
+                PolicyExpr::Not(sub_expr) => traverse(sub_expr, keys),
+                PolicyExpr::Threshold { subs, .. } => {
+                    for sub_expr in subs {
+                        traverse(sub_expr, keys)?;
+                    }
+                    Ok(())
+                }
+                PolicyExpr::WeightedThreshold { subs, .. } => {
+                    for (sub_expr, _) in subs {
+                        traverse(sub_expr, keys)?;
+                    }
+                    Ok(())
+                }
+            }
+        }
+
+        traverse(self, &mut keys)?;
+
+        Ok((keys))
     }
 }
 
 pub struct Compiler {}
+
+pub struct CompilationOptions<G: AffineRepr> {
+    pub name: String,                    // name of the policy
+    pub public_keys: HashMap<String, G>, // map from labels to public keys
+    pub iota: fn(G) -> G::ScalarField,   // hash function for DH
+}
 
 impl Compiler {
     pub fn new() -> Self {
@@ -29,8 +80,7 @@ impl Compiler {
     pub fn compile<G: AffineRepr>(
         &self,
         ast: &PolicyExpr,
-        public_keys: HashMap<String, G>, // map from labels to public keys
-        iota: fn(G) -> G::ScalarField,
+        options: CompilationOptions<G>,
     ) -> Result<PolicyTree<G>, PolicyError> {
         let mut idx = 0;
         // Helper function to recursively compile the AST
@@ -105,7 +155,10 @@ impl Compiler {
             }
         }
 
-        compile_inner(ast, &public_keys, &mut idx).map(|tree| PolicyTree::new(tree, iota))
+        compile_inner(ast, &options.public_keys, &mut idx).map(|mut tree| {
+            tree.rename(Some(&options.name));
+            PolicyTree::new(tree, options.iota)
+        })
     }
 }
 
@@ -123,8 +176,8 @@ mod tests {
         for i in 1..=3 {
             let scalar = Fr::from(i as u64);
             let point = G1Affine::generator().mul(scalar).into_affine();
-            public_keys.insert(format!("Key {}", i), point);
-            private_keys.insert(format!("Key {}", i), scalar);
+            public_keys.insert(format!("key{}", i), point);
+            private_keys.insert(format!("key{}", i), scalar);
         }
         (public_keys, private_keys)
     }
@@ -138,8 +191,12 @@ mod tests {
         let compiler = Compiler::new();
         let (public_keys, _) = setup_test_keys();
         let expr = PolicyExpr::Key("key1".to_string());
-
-        let result = compiler.compile(&expr, public_keys.clone(), iota).unwrap();
+        let options = CompilationOptions {
+            public_keys,
+            iota,
+            name: "Test Policy".to_string(),
+        };
+        let result = compiler.compile(&expr, options).unwrap();
         println!("test_compile_single_key: {}", result);
     }
 
@@ -152,7 +209,12 @@ mod tests {
             PolicyExpr::Key("key2".to_string()),
         ]);
 
-        let result = compiler.compile(&expr, public_keys.clone(), iota).unwrap();
+        let options = CompilationOptions {
+            public_keys,
+            iota,
+            name: "Test Policy".to_string(),
+        };
+        let result = compiler.compile(&expr, options).unwrap();
         println!("test_compile_and_expression: {}", result);
     }
 
@@ -165,7 +227,12 @@ mod tests {
             PolicyExpr::Key("key2".to_string()),
         ]);
 
-        let result = compiler.compile(&expr, public_keys.clone(), iota).unwrap();
+        let options = CompilationOptions {
+            public_keys,
+            iota,
+            name: "Test Policy".to_string(),
+        };
+        let result = compiler.compile(&expr, options).unwrap();
         println!("test_compile_or_expression: {}", result);
     }
 
@@ -181,7 +248,12 @@ mod tests {
             ]),
         ]);
 
-        let result = compiler.compile(&expr, public_keys.clone(), iota).unwrap();
+        let options = CompilationOptions {
+            public_keys,
+            iota,
+            name: "Test Policy".to_string(),
+        };
+        let result = compiler.compile(&expr, options).unwrap();
         println!("test_compile_complex_expression: {}", result);
     }
 
@@ -191,7 +263,14 @@ mod tests {
         let (public_keys, _) = setup_test_keys();
         let expr = PolicyExpr::Key("nonexistent".to_string());
 
-        let result = compiler.compile(&expr, public_keys.clone(), iota);
+        let result = compiler.compile(
+            &expr,
+            CompilationOptions {
+                public_keys,
+                iota,
+                name: "Test Policy".to_string(),
+            },
+        );
         assert!(result.is_err());
     }
 
@@ -201,7 +280,14 @@ mod tests {
         let (public_keys, _) = setup_test_keys();
         let expr = PolicyExpr::Not(Box::new(PolicyExpr::Key("key1".to_string())));
 
-        let result = compiler.compile(&expr, public_keys.clone(), iota);
+        let result = compiler.compile(
+            &expr,
+            CompilationOptions {
+                public_keys,
+                iota,
+                name: "Test Policy".to_string(),
+            },
+        );
         assert!(result.is_err());
     }
 }
