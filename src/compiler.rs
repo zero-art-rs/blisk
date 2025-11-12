@@ -6,8 +6,7 @@ use crate::{
     policy::{PolicyNode, PolicyTree},
 };
 use ark_ec::{AffineRepr, CurveGroup};
-use ark_ff::{BigInt, BigInteger, Field, PrimeField, UniformRand};
-use rand::Rng;
+use ark_ff::{Field, PrimeField, UniformRand};
 use std::result::Result;
 use tree_ds::prelude::*;
 
@@ -22,6 +21,7 @@ impl PolicyExpr {
             keys: &mut HashMap<String, (G::ScalarField, G)>,
         ) -> Result<(), PolicyError> {
             match expr {
+                PolicyExpr::Policy { expr, .. } => traverse(expr, keys),
                 PolicyExpr::Key(label) => {
                     if !keys.contains_key(label) {
                         // Generate a random scalar field element (private key)
@@ -60,16 +60,16 @@ impl PolicyExpr {
 
         traverse(self, &mut keys)?;
 
-        Ok((keys))
+        Ok(keys)
     }
 }
 
 pub struct Compiler {}
 
 pub struct CompilationOptions<G: AffineRepr> {
-    pub name: String,                    // name of the policy
     pub public_keys: HashMap<String, G>, // map from labels to public keys
     pub iota: fn(G) -> G::ScalarField,   // hash function for DH
+    pub transform_to_cnf: bool,
 }
 
 impl Compiler {
@@ -83,6 +83,13 @@ impl Compiler {
         options: CompilationOptions<G>,
     ) -> Result<PolicyTree<G>, PolicyError> {
         let mut idx = 0;
+
+        let processed_ast = if options.transform_to_cnf {
+            ast.to_cnf()?
+        } else {
+            ast.clone()
+        };
+
         // Helper function to recursively compile the AST
         fn compile_inner<G: AffineRepr>(
             expr: &PolicyExpr,
@@ -90,6 +97,7 @@ impl Compiler {
             idx: &mut u64,
         ) -> Result<Tree<u64, PolicyNode<G>>, PolicyError> {
             match expr {
+                PolicyExpr::Policy { expr, .. } => compile_inner(expr, public_keys, idx),
                 // Convert leaf node (key) by looking up in public_keys map
                 PolicyExpr::Key(label) => {
                     let key = public_keys.get(label).ok_or_else(|| {
@@ -154,9 +162,12 @@ impl Compiler {
                 )),
             }
         }
-
-        compile_inner(ast, &options.public_keys, &mut idx).map(|mut tree| {
-            tree.rename(Some(&options.name));
+        let name = match ast {
+            PolicyExpr::Policy { name, expr: _ } => Some(name.as_str()),
+            _ => None,
+        };
+        compile_inner(&processed_ast, &options.public_keys, &mut idx).map(|mut tree| {
+            tree.rename(name);
             PolicyTree::new(tree, options.iota)
         })
     }
@@ -165,36 +176,25 @@ impl Compiler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ark_ec::CurveGroup;
+    use crate::parser;
     use ark_ed25519::{EdwardsAffine as G1Affine, Fr};
-    use std::ops::Mul;
+    use ark_ff::BigInteger;
 
-    fn setup_test_keys() -> (HashMap<String, G1Affine>, HashMap<String, Fr>) {
-        let mut public_keys = HashMap::new();
-        let mut private_keys = HashMap::new();
-        // Generate some test public keys using random scalars
-        for i in 1..=3 {
-            let scalar = Fr::from(i as u64);
-            let point = G1Affine::generator().mul(scalar).into_affine();
-            public_keys.insert(format!("key{}", i), point);
-            private_keys.insert(format!("key{}", i), scalar);
-        }
-        (public_keys, private_keys)
-    }
-
-    fn iota(P: G1Affine) -> Fr {
-        P.x().unwrap().into_bigint().into()
+    fn iota(p: G1Affine) -> Fr {
+        Fr::from_le_bytes_mod_order(&p.x().unwrap().into_bigint().to_bytes_le())
     }
 
     #[test]
     fn test_compile_single_key() {
         let compiler = Compiler::new();
-        let (public_keys, _) = setup_test_keys();
         let expr = PolicyExpr::Key("key1".to_string());
+        let keys = expr.generate_random_keys::<G1Affine>().unwrap();
+        let public_keys = keys.into_iter().map(|(k, (_, pk))| (k, pk)).collect();
+
         let options = CompilationOptions {
             public_keys,
             iota,
-            name: "Test Policy".to_string(),
+            transform_to_cnf: false,
         };
         let result = compiler.compile(&expr, options).unwrap();
         println!("test_compile_single_key: {}", result);
@@ -203,16 +203,17 @@ mod tests {
     #[test]
     fn test_compile_and_expression() {
         let compiler = Compiler::new();
-        let (public_keys, _) = setup_test_keys();
         let expr = PolicyExpr::And(vec![
             PolicyExpr::Key("key1".to_string()),
             PolicyExpr::Key("key2".to_string()),
         ]);
+        let keys = expr.generate_random_keys::<G1Affine>().unwrap();
+        let public_keys = keys.into_iter().map(|(k, (_, pk))| (k, pk)).collect();
 
         let options = CompilationOptions {
             public_keys,
             iota,
-            name: "Test Policy".to_string(),
+            transform_to_cnf: false,
         };
         let result = compiler.compile(&expr, options).unwrap();
         println!("test_compile_and_expression: {}", result);
@@ -221,16 +222,17 @@ mod tests {
     #[test]
     fn test_compile_or_expression() {
         let compiler = Compiler::new();
-        let (public_keys, _) = setup_test_keys();
         let expr = PolicyExpr::Or(vec![
             PolicyExpr::Key("key1".to_string()),
             PolicyExpr::Key("key2".to_string()),
         ]);
+        let keys = expr.generate_random_keys::<G1Affine>().unwrap();
+        let public_keys = keys.into_iter().map(|(k, (_, pk))| (k, pk)).collect();
 
         let options = CompilationOptions {
             public_keys,
             iota,
-            name: "Test Policy".to_string(),
+            transform_to_cnf: false,
         };
         let result = compiler.compile(&expr, options).unwrap();
         println!("test_compile_or_expression: {}", result);
@@ -239,7 +241,6 @@ mod tests {
     #[test]
     fn test_compile_complex_expression() {
         let compiler = Compiler::new();
-        let (public_keys, _) = setup_test_keys();
         let expr = PolicyExpr::And(vec![
             PolicyExpr::Key("key1".to_string()),
             PolicyExpr::And(vec![
@@ -247,11 +248,13 @@ mod tests {
                 PolicyExpr::Key("key3".to_string()),
             ]),
         ]);
+        let keys = expr.generate_random_keys::<G1Affine>().unwrap();
+        let public_keys = keys.into_iter().map(|(k, (_, pk))| (k, pk)).collect();
 
         let options = CompilationOptions {
             public_keys,
             iota,
-            name: "Test Policy".to_string(),
+            transform_to_cnf: false,
         };
         let result = compiler.compile(&expr, options).unwrap();
         println!("test_compile_complex_expression: {}", result);
@@ -260,7 +263,7 @@ mod tests {
     #[test]
     fn test_compile_invalid_key() {
         let compiler = Compiler::new();
-        let (public_keys, _) = setup_test_keys();
+        let public_keys = HashMap::new();
         let expr = PolicyExpr::Key("nonexistent".to_string());
 
         let result = compiler.compile(
@@ -268,7 +271,7 @@ mod tests {
             CompilationOptions {
                 public_keys,
                 iota,
-                name: "Test Policy".to_string(),
+                transform_to_cnf: false,
             },
         );
         assert!(result.is_err());
@@ -277,17 +280,35 @@ mod tests {
     #[test]
     fn test_compile_unimplemented_not() {
         let compiler = Compiler::new();
-        let (public_keys, _) = setup_test_keys();
         let expr = PolicyExpr::Not(Box::new(PolicyExpr::Key("key1".to_string())));
+        let keys = expr.generate_random_keys::<G1Affine>().unwrap();
+        let public_keys = keys.into_iter().map(|(k, (_, pk))| (k, pk)).collect();
 
         let result = compiler.compile(
             &expr,
             CompilationOptions {
                 public_keys,
                 iota,
-                name: "Test Policy".to_string(),
+                transform_to_cnf: false,
             },
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_compile_to_cnf() {
+        let compiler = Compiler::new();
+        let (_, expr) = parser::parse("(policy test_non_cnf (or A (and B (or C D))))").unwrap();
+        let keys = expr.generate_random_keys::<G1Affine>().unwrap();
+        let public_keys = keys.into_iter().map(|(k, (_, pk))| (k, pk)).collect();
+
+        let options = CompilationOptions {
+            public_keys,
+            iota,
+            transform_to_cnf: true,
+        };
+
+        let result = compiler.compile(&expr, options).unwrap();
+        println!("{}", result);
     }
 }

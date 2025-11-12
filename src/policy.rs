@@ -237,26 +237,23 @@ mod tests {
         Fr::from_le_bytes_mod_order(&P.x().unwrap().into_bigint().to_bytes_le())
     }
 
-    fn setup_test_keys(k: usize) -> (HashMap<String, G1Affine>, HashMap<String, Fr>) {
-        let mut public_keys = HashMap::new();
-        let mut private_keys = HashMap::new();
-        // Generate some test public keys using random scalars
-        for i in 1..=k {
-            let scalar = Fr::from(i as u64);
-            let point = G1Affine::generator().mul(scalar).into_affine();
-            public_keys.insert(format!("Key {}", i), point);
-            private_keys.insert(format!("Key {}", i), scalar);
-        }
-        (public_keys, private_keys)
-    }
-
     #[test]
     fn test_resolve_cnf() {
         let circuits = [
-            "(and A B)",
-            "(and (or A B) (or A C))",
-            "(and (or A B) C)",
-            "(and (or A (or B C)) (or B (or D C)))",
+            "(policy policy_A_and_B
+                (and A B))",
+            "(policy policy_A_or_BC
+                (and
+                    (or A B)
+                    (or A C)))",
+            "(policy policy_C_and_A_or_B
+                (and
+                    (or A B)
+                    C))",
+            "(policy policy_complex
+                (and
+                    (or A (or B C))
+                    (or B (or D C))))",
         ];
         let compiler = Compiler::new();
         for c in circuits {
@@ -268,8 +265,8 @@ mod tests {
                 .collect();
             let options = CompilationOptions {
                 public_keys,
+                transform_to_cnf: true,
                 iota,
-                name: "Test Policy".to_string(),
             };
             let policy = compiler.compile(&expr, options).unwrap();
             let resolved_policy = policy.resolve(test_keys["A"].0).unwrap();
