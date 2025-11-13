@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, vec::IntoIter};
 
 use crate::{
     errors::PolicyError,
@@ -69,6 +69,7 @@ pub struct Compiler {}
 pub struct CompilationOptions<G: AffineRepr> {
     pub public_keys: HashMap<String, G>, // map from labels to public keys
     pub iota: fn(G) -> G::ScalarField,   // hash function for DH
+    pub aggregate: fn(Vec<G>) -> G,
     pub transform_to_cnf: bool,
 }
 
@@ -168,7 +169,7 @@ impl Compiler {
         };
         compile_inner(&processed_ast, &options.public_keys, &mut idx).map(|mut tree| {
             tree.rename(name);
-            PolicyTree::new(tree, options.iota)
+            PolicyTree::new(tree, options.iota, options.aggregate)
         })
     }
 }
@@ -184,6 +185,12 @@ mod tests {
         Fr::from_le_bytes_mod_order(&p.x().unwrap().into_bigint().to_bytes_le())
     }
 
+    fn aggregate(points: Vec<G1Affine>) -> G1Affine {
+        points
+            .iter()
+            .fold(G1Affine::zero(), |acc, p| (acc + p).into())
+    }
+
     #[test]
     fn test_compile_single_key() {
         let compiler = Compiler::new();
@@ -194,6 +201,7 @@ mod tests {
         let options = CompilationOptions {
             public_keys,
             iota,
+            aggregate,
             transform_to_cnf: false,
         };
         let result = compiler.compile(&expr, options).unwrap();
@@ -213,6 +221,7 @@ mod tests {
         let options = CompilationOptions {
             public_keys,
             iota,
+            aggregate,
             transform_to_cnf: false,
         };
         let result = compiler.compile(&expr, options).unwrap();
@@ -232,6 +241,7 @@ mod tests {
         let options = CompilationOptions {
             public_keys,
             iota,
+            aggregate,
             transform_to_cnf: false,
         };
         let result = compiler.compile(&expr, options).unwrap();
@@ -254,6 +264,7 @@ mod tests {
         let options = CompilationOptions {
             public_keys,
             iota,
+            aggregate,
             transform_to_cnf: false,
         };
         let result = compiler.compile(&expr, options).unwrap();
@@ -271,6 +282,7 @@ mod tests {
             CompilationOptions {
                 public_keys,
                 iota,
+                aggregate,
                 transform_to_cnf: false,
             },
         );
@@ -289,6 +301,7 @@ mod tests {
             CompilationOptions {
                 public_keys,
                 iota,
+                aggregate,
                 transform_to_cnf: false,
             },
         );
@@ -305,6 +318,7 @@ mod tests {
         let options = CompilationOptions {
             public_keys,
             iota,
+            aggregate,
             transform_to_cnf: true,
         };
 

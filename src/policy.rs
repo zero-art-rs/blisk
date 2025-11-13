@@ -40,11 +40,21 @@ impl<G: AffineRepr> fmt::Display for PolicyNode<G> {
 pub struct PolicyTree<G: AffineRepr> {
     pub(crate) tree: Tree<u64, PolicyNode<G>>,
     pub(crate) iota: fn(G) -> G::ScalarField,
+    pub(crate) aggregate: fn(Vec<G>) -> G,
 }
 
 impl<G: AffineRepr> PolicyTree<G> {
-    pub fn new(tree: Tree<u64, PolicyNode<G>>, iota: fn(G) -> G::ScalarField) -> Self {
-        Self { tree, iota }.resolve_and_gates()
+    pub fn new(
+        tree: Tree<u64, PolicyNode<G>>,
+        iota: fn(G) -> G::ScalarField,
+        aggregate: fn(Vec<G>) -> G,
+    ) -> Self {
+        Self {
+            tree,
+            iota,
+            aggregate,
+        }
+        .resolve_and_gates()
     }
 
     /// get a list of needed users labels to resolve the policy (build the tree completely)
@@ -112,7 +122,8 @@ impl<G: AffineRepr> PolicyTree<G> {
                     .unwrap()
                     .iter()
                     .map(|x| self.resolve_and_gate(&self.tree.get_node_by_id(x).unwrap()))
-                    .fold_options(G::ZERO, |acc, x| (acc + x).into());
+                    .collect::<Option<Vec<_>>>()
+                    .map(self.aggregate);
                 root.update_value(|v| *v = Some(PolicyNode::AndGate(res)))
                     .unwrap();
                 res
@@ -223,6 +234,12 @@ mod tests {
         Fr::from_le_bytes_mod_order(&P.x().unwrap().into_bigint().to_bytes_le())
     }
 
+    fn aggregate(points: Vec<G1Affine>) -> G1Affine {
+        points
+            .iter()
+            .fold(G1Affine::zero(), |acc, p| (acc + p).into())
+    }
+
     #[test]
     fn test_resolve_cnf() {
         let circuits = [
@@ -252,6 +269,7 @@ mod tests {
             let options = CompilationOptions {
                 public_keys,
                 transform_to_cnf: true,
+                aggregate,
                 iota,
             };
             let policy = compiler.compile(&expr, options).unwrap();

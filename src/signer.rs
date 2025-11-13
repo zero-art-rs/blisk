@@ -1,7 +1,9 @@
 use crate::errors::PolicyError;
+use crate::musig2::{
+    DefaultMuSig2Hash, MuSig2Error, MuSig2HashFunction, MuSig2Session, MuSig2Signature,
+};
 use crate::policy::PolicyTree;
 use ark_ec::{AffineRepr, CurveGroup};
-use ark_ff::PrimeField;
 
 pub struct Signer<G: AffineRepr> {
     secret_key: G::ScalarField,
@@ -19,6 +21,9 @@ impl<G: AffineRepr> Signer<G> {
     pub fn resolve_policy(&self, policy_tree: PolicyTree<G>) -> Result<PolicyTree<G>, PolicyError> {
         policy_tree.resolve(self.secret_key)
     }
-    
-    
+
+    /// Returns the signer's public key
+    pub fn get_public_key(&self) -> G {
+        self.public_key
+    }
 }

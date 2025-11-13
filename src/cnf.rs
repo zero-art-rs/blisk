@@ -14,7 +14,59 @@ use std::result::Result;
 /// for CNF conversion and will result in an error.
 
 impl PolicyExpr {
+    /// Checks if a policy expression is already in Conjunctive Normal Form (CNF).
+    ///
+    /// A policy expression is in CNF if:
+    /// 1. It is a single key (literal)
+    /// 2. It is an OR of keys/literals (a single clause)
+    /// 3. It is an AND of clauses, where each clause is an OR of keys/literals
+    pub fn is_cnf(&self) -> bool {
+        match self {
+            // A single key is in CNF
+            PolicyExpr::Key(_) => true,
+
+            // An OR of keys is a clause, which is in CNF
+            PolicyExpr::Or(subs) => {
+                // Check that all subexpressions are keys (literals)
+                subs.iter().all(|sub| matches!(sub, PolicyExpr::Key(_)))
+            }
+
+            // An AND of clauses is in CNF if each clause is an OR of keys
+            PolicyExpr::And(subs) => {
+                if subs.is_empty() {
+                    return true;
+                }
+
+                subs.iter().all(|sub| {
+                    match sub {
+                        // A key within an AND is a degenerate clause (OR with one element)
+                        PolicyExpr::Key(_) => true,
+
+                        // An OR within an AND must only contain keys
+                        PolicyExpr::Or(or_subs) => or_subs
+                            .iter()
+                            .all(|or_sub| matches!(or_sub, PolicyExpr::Key(_))),
+
+                        // Any other expression within an AND means it's not in CNF
+                        _ => false,
+                    }
+                })
+            }
+
+            // A named policy is in CNF if its inner expression is in CNF
+            PolicyExpr::Policy { expr, .. } => expr.is_cnf(),
+
+            // NOT, Threshold, and WeightedThreshold are not in CNF
+            _ => false,
+        }
+    }
+
     pub fn to_cnf(&self) -> Result<PolicyExpr, PolicyError> {
+        // If the expression is already in CNF, just return it
+        if self.is_cnf() {
+            return Ok(self.clone());
+        }
+
         self.to_nnf()?.distribute()?.ensure_binary_or()
     }
 
@@ -187,6 +239,70 @@ impl PolicyExpr {
 mod tests {
     use super::*;
     use crate::parser;
+
+    #[test]
+    fn test_to_cnf_optimization() {
+        // Test that expressions already in CNF are returned unchanged
+
+        // A single key is already CNF
+        let (_, key) = parser::parse("A").unwrap();
+        let key_cnf = key.clone().to_cnf().unwrap();
+        assert_eq!(key, key_cnf);
+
+        // An OR of keys is already CNF
+        let (_, or_expr) = parser::parse("(or A B C)").unwrap();
+        let or_cnf = or_expr.clone().to_cnf().unwrap();
+        assert_eq!(or_expr, or_cnf);
+
+        // An AND of keys is already CNF
+        let (_, and_expr) = parser::parse("(and A B C)").unwrap();
+        let and_cnf = and_expr.clone().to_cnf().unwrap();
+        assert_eq!(and_expr, and_cnf);
+
+        // An AND of ORs of keys is already CNF
+        let (_, complex_expr) = parser::parse("(and (or A B) (or C D) E)").unwrap();
+        let complex_cnf = complex_expr.clone().to_cnf().unwrap();
+        assert_eq!(complex_expr, complex_cnf);
+    }
+
+    #[test]
+    fn test_is_cnf() {
+        // Test a single key (should be CNF)
+        let (_, expr1) = parser::parse("A").unwrap();
+        assert!(expr1.is_cnf());
+
+        // Test an OR of keys (should be CNF)
+        let (_, expr2) = parser::parse("(or A B C)").unwrap();
+        assert!(expr2.is_cnf());
+
+        // Test an AND of keys (should be CNF)
+        let (_, expr3) = parser::parse("(and A B C)").unwrap();
+        assert!(expr3.is_cnf());
+
+        // Test an AND of ORs of keys (should be CNF)
+        let (_, expr4) = parser::parse("(and (or A B) (or C D) E)").unwrap();
+        assert!(expr4.is_cnf());
+
+        // Test a named policy with CNF inside (should be CNF)
+        let (_, expr5) = parser::parse("(policy myPolicy (and (or A B) C))").unwrap();
+        assert!(expr5.is_cnf());
+
+        // Test NOT (should not be CNF)
+        let (_, expr6) = parser::parse("(not A)").unwrap();
+        assert!(!expr6.is_cnf());
+
+        // Test nested OR (should not be CNF)
+        let (_, expr7) = parser::parse("(or A (or B C))").unwrap();
+        assert!(!expr7.is_cnf());
+
+        // Test nested AND in OR (should not be CNF)
+        let (_, expr8) = parser::parse("(or A (and B C))").unwrap();
+        assert!(!expr8.is_cnf());
+
+        // Test threshold (should not be CNF)
+        let (_, expr9) = parser::parse("(threshold 2 A B C)").unwrap();
+        assert!(!expr9.is_cnf());
+    }
 
     #[test]
     fn test_cnf_transform() {
