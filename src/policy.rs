@@ -207,20 +207,6 @@ impl<G: AffineRepr> Display for PolicyTree<G> {
     }
 }
 
-pub struct Signer<G: AffineRepr> {
-    secret_key: G::ScalarField,
-    public_key: G,
-}
-
-impl<G: AffineRepr> Signer<G> {
-    pub fn new(secret_key: G::ScalarField, public_key: G) -> Self {
-        Self {
-            secret_key,
-            public_key,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -251,8 +237,8 @@ mod tests {
                     (or A B)
                     C))",
             "(policy policy_complex
-                (and
-                    (or A (or B C))
+                (or
+                    (and A (or B C))
                     (or B (or D C))))",
         ];
         let compiler = Compiler::new();
