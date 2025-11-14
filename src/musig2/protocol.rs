@@ -52,66 +52,6 @@ impl<S: PrimeField> MuSig2HashFunction<S> for DefaultMuSig2Hash<S> {
     }
 }
 
-/// Initialize a new MuSig2 signing session
-pub fn create_session<G, H>(
-    session_id: String,
-    message: Vec<u8>,
-    local_public_key: G,
-    cosigner_public_keys: Vec<G>,
-    hash_function: H,
-) -> Result<MuSig2Session<G, H>, MuSig2Error>
-where
-    G: AffineRepr,
-    H: MuSig2HashFunction<G::ScalarField>,
-{
-    // Verify that the local signer is in the cosigner list
-    if !cosigner_public_keys.contains(&local_public_key) {
-        return Err(MuSig2Error::SignerNotInCosigners);
-    }
-
-    // Sort the public keys lexicographically
-    let mut sorted_keys = cosigner_public_keys.clone();
-    sorted_keys.sort_by(|a, b| {
-        let mut a_bytes = Vec::new();
-        let mut b_bytes = Vec::new();
-        a.serialize_compressed(&mut a_bytes).unwrap();
-        b.serialize_compressed(&mut b_bytes).unwrap();
-        a_bytes.cmp(&b_bytes)
-    });
-
-    // Find the local signer's index
-    let mut local_idx = None;
-    for (idx, key) in sorted_keys.iter().enumerate() {
-        if *key == local_public_key {
-            local_idx = Some(idx);
-            break;
-        }
-    }
-
-    if local_idx.is_none() {
-        return Err(MuSig2Error::SignerNotInCosigners);
-    }
-
-    // Create a new session with initial state
-    Ok(MuSig2Session {
-        session_id,
-        state: MuSig2SessionState::Initialized,
-        message,
-        cosigner_public_keys: sorted_keys,
-        key_aggregation_coeffs: HashMap::new(),
-        aggregated_public_key: None,
-        local_signer_idx: local_idx,
-        secret_nonces: None,
-        public_nonces: HashMap::new(),
-        nonce_aggregation_coeff: None,
-        aggregated_nonce: None,
-        challenge: None,
-        partial_signatures: HashMap::new(),
-        final_signature: None,
-        hash_function,
-    })
-}
-
 /// Aggregate multiple public keys into a single MuSig2 public key
 ///
 /// This function computes an aggregated public key from multiple individual public keys
@@ -222,7 +162,6 @@ pub fn aggregate_partial_signatures<G: AffineRepr>(
     })
 }
 
-/// Verify a MuSig2 signature against a public key and message
 /// Verify a MuSig2 signature against a message and aggregated public key
 pub fn verify_signature<G, H>(
     aggregated_public_key: G,
@@ -261,6 +200,66 @@ where
     G: AffineRepr,
     H: MuSig2HashFunction<G::ScalarField>,
 {
+    /// Initialize a new MuSig2 signing session
+    pub fn new(
+        session_id: String,
+        message: Vec<u8>,
+        local_public_key: G,
+        cosigner_public_keys: Vec<G>,
+        hash_function: H,
+    ) -> Result<MuSig2Session<G, H>, MuSig2Error>
+    where
+        G: AffineRepr,
+        H: MuSig2HashFunction<G::ScalarField>,
+    {
+        // Verify that the local signer is in the cosigner list
+        if !cosigner_public_keys.contains(&local_public_key) {
+            return Err(MuSig2Error::SignerNotInCosigners);
+        }
+
+        // Sort the public keys lexicographically
+        let mut sorted_keys = cosigner_public_keys.clone();
+        sorted_keys.sort_by(|a, b| {
+            let mut a_bytes = Vec::new();
+            let mut b_bytes = Vec::new();
+            a.serialize_compressed(&mut a_bytes).unwrap();
+            b.serialize_compressed(&mut b_bytes).unwrap();
+            a_bytes.cmp(&b_bytes)
+        });
+
+        // Find the local signer's index
+        let mut local_idx = None;
+        for (idx, key) in sorted_keys.iter().enumerate() {
+            if *key == local_public_key {
+                local_idx = Some(idx);
+                break;
+            }
+        }
+
+        if local_idx.is_none() {
+            return Err(MuSig2Error::SignerNotInCosigners);
+        }
+
+        // Create a new session with initial state
+        Ok(MuSig2Session {
+            session_id,
+            state: MuSig2SessionState::Initialized,
+            message,
+            cosigner_public_keys: sorted_keys,
+            key_aggregation_coeffs: HashMap::new(),
+            aggregated_public_key: None,
+            local_signer_idx: local_idx,
+            secret_nonces: None,
+            public_nonces: HashMap::new(),
+            nonce_aggregation_coeff: None,
+            aggregated_nonce: None,
+            challenge: None,
+            partial_signatures: HashMap::new(),
+            final_signature: None,
+            hash_function,
+        })
+    }
+
     /// Compute the aggregated public key for the session
     pub fn compute_aggregated_key(&mut self) -> Result<G, MuSig2Error> {
         if self.aggregated_public_key.is_some() {
@@ -456,11 +455,6 @@ where
             return Err(MuSig2Error::InvalidSessionState(
                 "Nonces must be generated before signing".into(),
             ));
-        }
-
-        // Ensure aggregated nonce is computed
-        if self.aggregated_nonce.is_none() {
-            self.compute_aggregated_nonce()?;
         }
 
         // Get the nonces and coefficients

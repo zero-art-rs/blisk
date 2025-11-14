@@ -169,7 +169,12 @@ impl Compiler {
         };
         compile_inner(&processed_ast, &options.public_keys, &mut idx).map(|mut tree| {
             tree.rename(name);
-            PolicyTree::new(tree, options.iota, options.aggregate)
+            PolicyTree::new(
+                tree,
+                processed_ast.is_cnf(),
+                options.iota,
+                options.aggregate,
+            )
         })
     }
 }

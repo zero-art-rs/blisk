@@ -39,18 +39,21 @@ impl<G: AffineRepr> fmt::Display for PolicyNode<G> {
 #[derive(Debug)]
 pub struct PolicyTree<G: AffineRepr> {
     pub(crate) tree: Tree<u64, PolicyNode<G>>,
+    pub(crate) is_cnf: bool,
     pub(crate) iota: fn(G) -> G::ScalarField,
     pub(crate) aggregate: fn(Vec<G>) -> G,
 }
 
 impl<G: AffineRepr> PolicyTree<G> {
-    pub fn new(
+    pub(crate) fn new(
         tree: Tree<u64, PolicyNode<G>>,
+        is_cnf: bool,
         iota: fn(G) -> G::ScalarField,
         aggregate: fn(Vec<G>) -> G,
     ) -> Self {
         Self {
             tree,
+            is_cnf,
             iota,
             aggregate,
         }
@@ -101,6 +104,59 @@ impl<G: AffineRepr> PolicyTree<G> {
             .is_some()
     }
 
+    pub fn get_clauses_public_keys(&self) -> Result<Vec<G>, PolicyError> {
+        if !self.is_cnf {
+            return Err(PolicyError::NotCNF);
+        }
+        self.tree
+            .get_root_node()
+            .unwrap()
+            .get_children_ids()
+            .unwrap()
+            .iter()
+            .map(|child_id| {
+                if let PolicyNode::OrGate(clause_pk) = self
+                    .tree
+                    .get_node_by_id(child_id)
+                    .unwrap()
+                    .get_value()
+                    .unwrap()
+                    .unwrap()
+                {
+                    clause_pk.ok_or(PolicyError::MissingClausePublicKey)
+                } else {
+                    Err(PolicyError::InvalidGate)
+                }
+            })
+            .collect()
+    }
+
+    pub fn resolve_clauses_private_keys(
+        &self,
+        secret_key: G::ScalarField,
+    ) -> Result<Vec<(G::ScalarField, G)>, PolicyError> {
+        if !self.is_cnf {
+            return Err(PolicyError::NotCNF);
+        }
+        Ok(self
+            .tree
+            .get_root_node()
+            .unwrap()
+            .get_children_ids()
+            .unwrap()
+            .iter()
+            .filter_map(|child_id| {
+                self.resolve_or_gate(&self.tree.get_node_by_id(child_id).unwrap(), secret_key)
+                    .map(|(sk, pk)| match (sk, pk) {
+                        (Some(s), Some(p)) => Some((s, p)),
+                        _ => None,
+                    })
+                    .ok()
+                    .flatten()
+            })
+            .collect())
+    }
+
     fn resolve_and_gate(&self, root: &Node<u64, PolicyNode<G>>) -> Option<G> {
         match root.get_value().unwrap().unwrap() {
             PolicyNode::UserKey((_, u)) => Some(u),
@@ -144,8 +200,7 @@ impl<G: AffineRepr> PolicyTree<G> {
                     false => Ok((None, Some(u))),
                 }
             }
-            PolicyNode::OrGate(Some(u)) => Ok((None, Some(u))),
-            PolicyNode::OrGate(None) => {
+            PolicyNode::OrGate(_) => {
                 if root.get_children_ids().unwrap().len() != 2 {
                     return Err(PolicyError::ResolutionError(
                         "OR gate must have exactly 2 childs".into(),

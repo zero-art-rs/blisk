@@ -1,8 +1,8 @@
 #[cfg(test)]
 mod tests {
     use crate::musig2::{
-        DefaultMuSig2Hash, MuSig2SessionState, aggregate_public_keys,
-        aggregate_public_keys_with_coeffs, create_session, verify_signature,
+        DefaultMuSig2Hash, MuSig2Session, MuSig2SessionState, aggregate_public_keys,
+        aggregate_public_keys_with_coeffs, verify_signature,
     };
     use ark_ec::{AffineRepr, CurveGroup};
     use ark_ed25519::{EdwardsAffine, Fr};
@@ -31,7 +31,7 @@ mod tests {
         let hash_fn = DefaultMuSig2Hash::new();
 
         // Create session for signer 1
-        let session = create_session(
+        let session = MuSig2Session::new(
             session_id.clone(),
             message.clone(),
             pk1,
@@ -66,7 +66,7 @@ mod tests {
         let hash_fn = DefaultMuSig2Hash::new();
 
         // Create sessions for all signers
-        let mut session1 = create_session(
+        let mut session1 = MuSig2Session::new(
             session_id.clone(),
             message.clone(),
             pk1,
@@ -75,7 +75,7 @@ mod tests {
         )
         .expect("Session 1 creation should succeed");
 
-        let mut session2 = create_session(
+        let mut session2 = MuSig2Session::new(
             session_id.clone(),
             message.clone(),
             pk2,
@@ -84,7 +84,7 @@ mod tests {
         )
         .expect("Session 2 creation should succeed");
 
-        let mut session3 = create_session(
+        let mut session3 = MuSig2Session::new(
             session_id.clone(),
             message.clone(),
             pk3,
@@ -137,7 +137,7 @@ mod tests {
         let hash_fn = DefaultMuSig2Hash::new();
 
         // Create sessions for all signers
-        let mut session1 = create_session(
+        let mut session1 = MuSig2Session::new(
             session_id.clone(),
             message.clone(),
             pk1,
@@ -146,7 +146,7 @@ mod tests {
         )
         .expect("Session 1 creation should succeed");
 
-        let mut session2 = create_session(
+        let mut session2 = MuSig2Session::new(
             session_id.clone(),
             message.clone(),
             pk2,
@@ -155,7 +155,7 @@ mod tests {
         )
         .expect("Session 2 creation should succeed");
 
-        let mut session3 = create_session(
+        let mut session3 = MuSig2Session::new(
             session_id.clone(),
             message.clone(),
             pk3,
@@ -289,7 +289,7 @@ mod tests {
         let hash_fn = DefaultMuSig2Hash::new();
 
         // Create sessions for all signers
-        let mut session1 = create_session(
+        let mut session1 = MuSig2Session::new(
             session_id.clone(),
             message.clone(),
             pk1,
@@ -298,7 +298,7 @@ mod tests {
         )
         .expect("Session 1 creation should succeed");
 
-        let mut session2 = create_session(
+        let mut session2 = MuSig2Session::new(
             session_id.clone(),
             message.clone(),
             pk2,
@@ -423,8 +423,8 @@ mod tests {
         let message = b"Test message".to_vec();
         let session_id = "test-session".to_string();
 
-        // Note: The create_session function will sort keys internally
-        let mut session = create_session(
+        // Note: The MuSig2Session::new function will sort keys internally
+        let mut session = MuSig2Session::new(
             session_id,
             message,
             pk1,
