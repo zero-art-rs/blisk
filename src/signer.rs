@@ -174,20 +174,22 @@ mod tests {
                                                 (and B C D)))";
         let compiler = Compiler::new();
         let (_, expr) = parse(threshold_3_of_4_circuit).unwrap();
+        // generate random keys for each party (A,B,C,D)
         let test_keys = expr.generate_random_keys().unwrap();
         let public_keys = test_keys
             .iter()
             .map(|(k, (_, pk))| (k.clone(), *pk))
             .collect();
+        // initialize the compilation options
         let options = CompilationOptions {
             public_keys,
-            transform_to_cnf: true,
+            transform_to_cnf: true, // acquire the policy circuit to be in CNF form
             aggregate: |points| {
                 musig2::aggregate_public_keys(&points, &DefaultMuSig2Hash::new()).unwrap()
-            },
+            }, // initialize the aggregate function of MuSig2 protocol
             iota: |P: G1Affine| {
                 Fr::from_le_bytes_mod_order(&P.x().unwrap().into_bigint().to_bytes_le())
-            },
+            }, // initialize the iota function for DH
         };
         let policy = compiler.compile(&expr, options).unwrap();
         let mut resolved_policy = policy
@@ -244,9 +246,13 @@ mod tests {
             signer_A.process_nonces(key, nonces).unwrap();
             signer_B.process_nonces(key, nonces).unwrap();
         }
+
+        // they aggregate nonces
         let R1 = signer_A.aggregate_nonces().unwrap();
         let R2 = signer_B.aggregate_nonces().unwrap();
         let R3 = signer_C.aggregate_nonces().unwrap();
+
+        // assure nonces are equal
         assert!(R1 == R2 && R2 == R3);
 
         // they sign the message
@@ -258,7 +264,10 @@ mod tests {
         let combined_sig =
             aggregate_partial_signatures(&[a_sig, b_sig, c_sig].concat(), R1).unwrap();
 
+        // aggregated public key is obtained from the root node of the resolved policy tree
         let aggregated_public_key = resolved_policy.get_public_key().unwrap();
+
+        // one could easily verify the signature using the aggregated public key
         let verified = verify_signature(
             aggregated_public_key,
             message,
