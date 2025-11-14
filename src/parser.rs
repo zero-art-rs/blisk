@@ -7,7 +7,7 @@ use nom::{
     sequence::{delimited, preceded},
 };
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Hash, Eq)]
 pub enum PolicyExpr {
     Key(String),
     And(Vec<PolicyExpr>),

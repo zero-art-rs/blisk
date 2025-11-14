@@ -1,6 +1,7 @@
 use crate::musig2::error::MuSig2Error;
 use ark_ec::AffineRepr;
 use ark_ff::PrimeField;
+use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use std::collections::HashMap;
 use std::fmt::Debug;
 
@@ -108,7 +109,7 @@ where
 }
 
 /// The final MuSig2 signature
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, CanonicalSerialize, CanonicalDeserialize)]
 pub struct MuSig2Signature<G: AffineRepr> {
     /// The aggregated nonce point
     pub r: G,

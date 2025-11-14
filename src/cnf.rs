@@ -1,7 +1,8 @@
 use crate::errors::PolicyError;
 use crate::parser::PolicyExpr;
+use std::collections::HashSet;
+use std::hash::{BuildHasherDefault, DefaultHasher};
 use std::result::Result;
-
 /// Converts a policy expression into Conjunctive Normal Form (CNF).
 ///
 /// The conversion follows these steps:
@@ -117,28 +118,62 @@ impl PolicyExpr {
                     .iter()
                     .map(|sub| sub.distribute())
                     .collect::<Result<Vec<_>, _>>()?;
-                let mut new_subs = Vec::new();
+                // Flatten AND of ANDs
+                let mut flattened_subs = Vec::new();
                 for sub in processed_subs {
                     if let PolicyExpr::And(inner_subs) = sub {
-                        new_subs.extend(inner_subs);
+                        flattened_subs.extend(inner_subs);
                     } else {
-                        new_subs.push(sub);
+                        flattened_subs.push(sub);
                     }
                 }
-                Ok(PolicyExpr::And(new_subs))
+
+                // Apply idempotency to remove duplicates
+                let mut unique_subs = Vec::new();
+                for sub in flattened_subs {
+                    if !unique_subs.contains(&sub) {
+                        unique_subs.push(sub);
+                    }
+                }
+
+                // Sort for deterministic ordering (helps with deduplication)
+                unique_subs.sort_by(|a, b| format!("{:?}", a).cmp(&format!("{:?}", b)));
+
+                Ok(PolicyExpr::And(unique_subs))
             }
             PolicyExpr::Or(subs) => {
-                let processed_subs = subs
+                // First apply idempotency - remove duplicates in inputs
+                let mut unique_inputs = Vec::new();
+                for sub in subs {
+                    if !unique_inputs.contains(sub) {
+                        unique_inputs.push(sub.clone());
+                    }
+                }
+
+                // Process the deduplicated subexpressions
+                let processed_subs = unique_inputs
                     .iter()
                     .map(|sub| sub.distribute())
                     .collect::<Result<Vec<_>, _>>()?;
-                if processed_subs.is_empty() {
+
+                // Apply idempotency again after distribution
+                let mut unique_subs = Vec::new();
+                for sub in processed_subs {
+                    if !unique_subs.contains(&sub) {
+                        unique_subs.push(sub);
+                    }
+                }
+
+                // Sort for deterministic ordering
+                unique_subs.sort_by(|a, b| format!("{:?}", a).cmp(&format!("{:?}", b)));
+
+                if unique_subs.is_empty() {
                     // This represents `false`, which is not well-supported in the tree.
                     // An empty OR is usually considered false. Let's return an empty OR
                     // and let the caller decide.
                     return Ok(PolicyExpr::Or(vec![]));
                 }
-                let mut it = processed_subs.into_iter();
+                let mut it = unique_subs.into_iter();
                 let first = it.next().unwrap();
                 it.try_fold(first, |acc, next| Self::distribute_two(&acc, &next))
             }
@@ -154,6 +189,41 @@ impl PolicyExpr {
         }
     }
 
+    // Helper to extract all literals from an expression (flattening nested ORs)
+    fn extract_literals(expr: &PolicyExpr, literals: &mut Vec<PolicyExpr>) {
+        match expr {
+            PolicyExpr::Key(_) => {
+                if !literals.contains(expr) {
+                    literals.push(expr.clone());
+                }
+            }
+            PolicyExpr::Or(subs) => {
+                for sub in subs {
+                    Self::extract_literals(sub, literals);
+                }
+            }
+            _ => {
+                if !literals.contains(expr) {
+                    literals.push(expr.clone());
+                }
+            }
+        }
+    }
+
+    /// checks if clause_b is a subset of clause_a (e.g. absorbs it in terms of CNF)
+    fn is_subset(clause_a: &PolicyExpr, clause_b: &PolicyExpr) -> bool {
+        let mut flattened_a = Vec::new();
+        let mut flattened_b = Vec::new();
+
+        Self::extract_literals(clause_a, &mut flattened_a);
+        Self::extract_literals(clause_b, &mut flattened_b);
+
+        HashSet::<PolicyExpr, BuildHasherDefault<DefaultHasher>>::from_iter(
+            flattened_b.iter().cloned(),
+        )
+        .is_subset(&HashSet::from_iter(flattened_a.iter().cloned()))
+    }
+
     /// Helper for `distribute`: distributes `a OR b` where `a` and `b` are CNFs.
     fn distribute_two(a: &PolicyExpr, b: &PolicyExpr) -> Result<PolicyExpr, PolicyError> {
         match (a, b) {
@@ -165,34 +235,84 @@ impl PolicyExpr {
                         clauses.push(Self::distribute_two(sub_a, sub_b)?);
                     }
                 }
-                Ok(PolicyExpr::And(clauses))
+
+                // Deduplicate clauses (applying idempotency)
+                let mut unique_clauses = Vec::new();
+                for clause in clauses {
+                    if !unique_clauses.contains(&clause) {
+                        unique_clauses.push(clause);
+                    }
+                }
+
+                Ok(PolicyExpr::And(unique_clauses))
             }
             (PolicyExpr::And(subs_a), other_b) => {
-                let clauses = subs_a
-                    .iter()
-                    .map(|sub_a| Self::distribute_two(sub_a, other_b))
-                    .collect::<Result<Vec<_>, _>>()?;
-                Ok(PolicyExpr::And(clauses))
+                // Distribute each term from the AND over the other expression
+                let mut all_clauses = Vec::new();
+                for sub_a in subs_a {
+                    let distributed = Self::distribute_two(sub_a, other_b)?;
+
+                    // If the result is an AND, add its clauses; otherwise add the clause itself
+                    if let PolicyExpr::And(inner_clauses) = &distributed {
+                        all_clauses.extend(inner_clauses.clone());
+                    } else {
+                        all_clauses.push(distributed);
+                    }
+                }
+
+                // Apply idempotency to eliminate duplicate clauses
+                let mut unique_clauses = Vec::new();
+                for clause in all_clauses {
+                    if !unique_clauses.contains(&clause) {
+                        unique_clauses.push(clause);
+                    }
+                }
+
+                // Sort clauses for deterministic ordering
+                unique_clauses.sort_by(|a, b| format!("{:?}", a).cmp(&format!("{:?}", b)));
+
+                Ok(PolicyExpr::And(unique_clauses))
             }
             (other_a, PolicyExpr::And(subs_b)) => {
-                let clauses = subs_b
-                    .iter()
-                    .map(|sub_b| Self::distribute_two(other_a, sub_b))
-                    .collect::<Result<Vec<_>, _>>()?;
-                Ok(PolicyExpr::And(clauses))
+                // Distribute the other expression over each term from the AND
+                let mut all_clauses = Vec::new();
+                for sub_b in subs_b {
+                    let distributed = Self::distribute_two(other_a, sub_b)?;
+
+                    // If the result is an AND, add its clauses; otherwise add the clause itself
+                    if let PolicyExpr::And(inner_clauses) = &distributed {
+                        all_clauses.extend(inner_clauses.clone());
+                    } else {
+                        all_clauses.push(distributed);
+                    }
+                }
+
+                // Apply idempotency to eliminate duplicate clauses
+                let mut unique_clauses = Vec::new();
+                for clause in all_clauses {
+                    if !unique_clauses.contains(&clause) {
+                        unique_clauses.push(clause);
+                    }
+                }
+
+                // Sort clauses for deterministic ordering
+                unique_clauses.sort_by(|a, b| format!("{:?}", a).cmp(&format!("{:?}", b)));
+
+                Ok(PolicyExpr::And(unique_clauses))
             }
             // Base case: neither expression is an AND. They must be ORs of keys, or just keys.
             (other_a, other_b) => {
-                let mut new_subs = Vec::new();
-                match other_a {
-                    PolicyExpr::Or(subs_a) => new_subs.extend(subs_a.clone()),
-                    _ => new_subs.push(other_a.clone()),
-                };
-                match other_b {
-                    PolicyExpr::Or(subs_b) => new_subs.extend(subs_b.clone()),
-                    _ => new_subs.push(other_b.clone()),
-                }
-                Ok(PolicyExpr::Or(new_subs))
+                // Collect all literals from both expressions, flattening nested ORs
+                let mut all_literals = Vec::new();
+
+                // Extract literals from both expressions
+                Self::extract_literals(other_a, &mut all_literals);
+                Self::extract_literals(other_b, &mut all_literals);
+
+                // Sort literals for deterministic ordering
+                all_literals.sort_by(|a, b| format!("{:?}", a).cmp(&format!("{:?}", b)));
+
+                Ok(PolicyExpr::Or(all_literals))
             }
         }
     }
@@ -205,21 +325,96 @@ impl PolicyExpr {
                     .iter()
                     .map(|sub| sub.ensure_binary_or())
                     .collect::<Result<Vec<_>, _>>()?;
-                Ok(PolicyExpr::And(binary_or_subs))
+
+                // Flatten AND of ANDs (helps with CNF structure)
+                let mut flattened = Vec::new();
+                for sub in binary_or_subs {
+                    match sub {
+                        PolicyExpr::And(inner_subs) => flattened.extend(inner_subs),
+                        _ => flattened.push(sub),
+                    }
+                }
+
+                // Sort clauses for deterministic ordering
+                flattened.sort_by(|a, b| format!("{:?}", a).cmp(&format!("{:?}", b)));
+                // Apply idempotency to AND clauses
+                flattened.dedup();
+
+                // Apply absorption rule: if clause A is a subset of clause B, remove B
+                let mut minimal_clauses = Vec::new();
+                for clause_a in &flattened {
+                    // Check if this clause is absorbed by any already included clause
+                    let mut is_absorbed = false;
+                    for clause_b in &minimal_clauses {
+                        if Self::is_subset(clause_a, clause_b) {
+                            is_absorbed = true;
+                            break;
+                        }
+                    }
+
+                    if !is_absorbed {
+                        // If this clause wasn't absorbed, add it and remove any clauses it absorbs
+                        minimal_clauses.retain(|clause_b| !Self::is_subset(clause_b, clause_a));
+                        minimal_clauses.push(clause_a.clone());
+                    }
+                }
+
+                Ok(PolicyExpr::And(minimal_clauses))
             }
             PolicyExpr::Or(subs) => {
-                if subs.len() <= 2 {
-                    Ok(self.clone())
-                } else {
-                    let mut it = subs.iter().rev();
-                    let last = it.next().unwrap().clone();
-                    let second_last = it.next().unwrap().clone();
-                    let mut current_or = PolicyExpr::Or(vec![second_last, last]);
+                // Apply idempotency by flattening and deduplicating all OR expressions
 
-                    for sub in it {
-                        current_or = PolicyExpr::Or(vec![sub.clone(), current_or]);
+                // Helper function to extract all literals from OR expressions
+                fn flatten_or_expr(expr: &PolicyExpr, result: &mut Vec<PolicyExpr>) {
+                    match expr {
+                        PolicyExpr::Or(nested) => {
+                            // Recursively flatten nested ORs
+                            for sub in nested {
+                                flatten_or_expr(sub, result);
+                            }
+                        }
+                        _ => {
+                            // Add non-OR expressions directly if not already present
+                            if !result.contains(expr) {
+                                result.push(expr.clone());
+                            }
+                        }
                     }
-                    Ok(current_or)
+                }
+
+                // Flatten all nested OR expressions and deduplicate literals
+                let mut flattened = Vec::new();
+                for sub in subs {
+                    flatten_or_expr(sub, &mut flattened);
+                }
+
+                // Sort for deterministic ordering
+                flattened.sort_by(|a, b| format!("{:?}", a).cmp(&format!("{:?}", b)));
+
+                // Handle the base cases
+                if flattened.is_empty() {
+                    return Ok(PolicyExpr::Or(vec![]));
+                } else if flattened.len() <= 2 {
+                    return Ok(PolicyExpr::Or(flattened));
+                } else {
+                    // For more than 2 literals, build a balanced binary OR tree
+                    // (instead of right-associative) for better performance
+
+                    fn build_balanced_or_tree(literals: &[PolicyExpr]) -> PolicyExpr {
+                        if literals.len() == 1 {
+                            return literals[0].clone();
+                        } else if literals.len() == 2 {
+                            return PolicyExpr::Or(vec![literals[0].clone(), literals[1].clone()]);
+                        }
+
+                        let mid = literals.len() / 2;
+                        let left = build_balanced_or_tree(&literals[..mid]);
+                        let right = build_balanced_or_tree(&literals[mid..]);
+
+                        PolicyExpr::Or(vec![left, right])
+                    }
+
+                    Ok(build_balanced_or_tree(&flattened))
                 }
             }
             PolicyExpr::Key(_) => Ok(self.clone()),
@@ -325,5 +520,105 @@ mod tests {
                 ])
             ])
         );
+    }
+
+    #[test]
+    fn test_cnf_transform_threshold() {
+        // Test the threshold 3-of-4 formula
+        let (_, expr) =
+            parser::parse("(or (and A B C) (and A B D) (and A C D) (and B C D))").unwrap();
+
+        let cnf = expr.to_cnf().unwrap();
+        println!("{:#?}", cnf);
+        assert_eq!(
+            cnf,
+            PolicyExpr::And(vec![
+                PolicyExpr::Or(vec![
+                    PolicyExpr::Key("A".into()),
+                    PolicyExpr::Key("B".into())
+                ]),
+                PolicyExpr::Or(vec![
+                    PolicyExpr::Key("A".into()),
+                    PolicyExpr::Key("C".into()),
+                ]),
+                PolicyExpr::Or(vec![
+                    PolicyExpr::Key("A".into()),
+                    PolicyExpr::Key("D".into()),
+                ]),
+                PolicyExpr::Or(vec![
+                    PolicyExpr::Key("B".into()),
+                    PolicyExpr::Key("C".into()),
+                ]),
+                PolicyExpr::Or(vec![
+                    PolicyExpr::Key("B".into()),
+                    PolicyExpr::Key("D".into()),
+                ]),
+                PolicyExpr::Or(vec![
+                    PolicyExpr::Key("C".into()),
+                    PolicyExpr::Key("D".into()),
+                ])
+            ])
+        );
+    }
+
+    #[test]
+    fn test_idempotency() {
+        // Helper to extract unique keys from any expression
+        fn get_all_keys(expr: &PolicyExpr) -> Vec<String> {
+            match expr {
+                PolicyExpr::Key(k) => vec![k.clone()],
+                PolicyExpr::Or(subs) => {
+                    let mut keys = Vec::new();
+                    for sub in subs {
+                        keys.extend(get_all_keys(sub));
+                    }
+                    keys.sort();
+                    keys.dedup();
+                    keys
+                }
+                PolicyExpr::And(subs) => {
+                    let mut keys = Vec::new();
+                    for sub in subs {
+                        keys.extend(get_all_keys(sub));
+                    }
+                    keys.sort();
+                    keys.dedup();
+                    keys
+                }
+                _ => vec![],
+            }
+        }
+
+        // Test that duplicate literals in OR clauses are eliminated (idempotency law)
+        let (_, expr) = parser::parse("(or D D D)").unwrap();
+        let cnf = expr.to_cnf().unwrap();
+
+        // Get all keys and check for duplicates
+        let keys = get_all_keys(&cnf);
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0], "D".to_string());
+
+        // Test nested ORs with duplicates
+        let (_, expr2) = parser::parse("(or B (or D D D))").unwrap();
+        let cnf2 = expr2.to_cnf().unwrap();
+
+        // Get all unique keys
+        let keys2 = get_all_keys(&cnf2);
+
+        // Should have exactly B and D, no duplicates
+        assert_eq!(keys2.len(), 2);
+        assert!(keys2.contains(&"B".to_string()));
+        assert!(keys2.contains(&"D".to_string()));
+
+        // Add a more complex test
+        let (_, expr3) = parser::parse("(or A (or B B) (or C C C))").unwrap();
+        let cnf3 = expr3.to_cnf().unwrap();
+
+        // Should contain exactly A, B, C without duplicates
+        let keys3 = get_all_keys(&cnf3);
+        assert_eq!(keys3.len(), 3);
+        assert!(keys3.contains(&"A".to_string()));
+        assert!(keys3.contains(&"B".to_string()));
+        assert!(keys3.contains(&"C".to_string()));
     }
 }
