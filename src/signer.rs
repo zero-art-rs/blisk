@@ -153,19 +153,14 @@ mod tests {
     use crate::musig2;
     use crate::musig2::DefaultMuSig2Hash;
     use crate::musig2::aggregate_partial_signatures;
-    use crate::musig2::aggregate_public_keys;
     use crate::musig2::verify_signature;
-    use crate::parser::PolicyExpr;
     use crate::parser::parse;
-    use ark_ec::CurveGroup;
     use ark_ed25519::{EdwardsAffine as G1Affine, Fr};
     use ark_ff::{BigInteger, PrimeField};
     use rand::thread_rng;
-    use std::collections::HashMap;
-    use std::ops::Mul;
 
     #[test]
-    fn test_policy_signature() {
+    fn test_policy_3_of_4_signature() {
         let threshold_3_of_4_circuit = "(policy threshold_3_of_4_circuit
                                             (or
                                                 (and A B C)
@@ -201,6 +196,14 @@ mod tests {
             .unwrap();
 
         let message = b"test_message";
+
+        // Debug: print clause public keys
+        let all_clause_pks = resolved_policy.get_clauses_public_keys().unwrap();
+        println!("3-of-4 Total clause public keys: {}", all_clause_pks.len());
+        for (i, pk) in all_clause_pks.iter().enumerate() {
+            println!("  clause_pk[{}]: {:?}", i, pk);
+        }
+
         // create signers
         let mut signer_A = Signer::new(
             "Alice".into(),
@@ -210,6 +213,15 @@ mod tests {
             DefaultMuSig2Hash::new(),
         )
         .unwrap();
+        println!("Signer A has {} clause keys", signer_A.clauses_keys.len());
+        for (i, (_, pk)) in signer_A.clauses_keys.iter().enumerate() {
+            let in_clause_pks = all_clause_pks.contains(pk);
+            println!(
+                "  A clause_key[{}]: {:?} (in clause_pks: {})",
+                i, pk, in_clause_pks
+            );
+        }
+
         let mut signer_B = Signer::new(
             "Bob".into(),
             test_keys["B"].0,
@@ -218,6 +230,15 @@ mod tests {
             DefaultMuSig2Hash::new(),
         )
         .unwrap();
+        println!("Signer B has {} clause keys", signer_B.clauses_keys.len());
+        for (i, (_, pk)) in signer_B.clauses_keys.iter().enumerate() {
+            let in_clause_pks = all_clause_pks.contains(pk);
+            println!(
+                "  B clause_key[{}]: {:?} (in clause_pks: {})",
+                i, pk, in_clause_pks
+            );
+        }
+
         let mut signer_C = Signer::new(
             "Charlie".into(),
             test_keys["C"].0,
@@ -226,6 +247,15 @@ mod tests {
             DefaultMuSig2Hash::new(),
         )
         .unwrap();
+        println!("Signer C has {} clause keys", signer_C.clauses_keys.len());
+        for (i, (_, pk)) in signer_C.clauses_keys.iter().enumerate() {
+            let in_clause_pks = all_clause_pks.contains(pk);
+            println!(
+                "  C clause_key[{}]: {:?} (in clause_pks: {})",
+                i, pk, in_clause_pks
+            );
+        }
+
         // now only Alice, Bob, Charlie sign the message
 
         // they generate nonces
@@ -277,5 +307,162 @@ mod tests {
         .unwrap();
         // they print the result
         println!("Verification result: {}", verified);
+    }
+
+    fn test_policy_k_of_n_signature(k: usize, n: usize) {
+        use itertools::Itertools;
+
+        // Generate all 11-of-15 combinations as AND clauses combined with OR
+        let parties = {
+            let alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+            let count = n.min(26);
+            (0..count)
+                .map(|i| &alphabet[i..i + 1])
+                .collect::<Vec<&str>>()
+        };
+        let combinations: Vec<String> = parties
+            .iter()
+            .combinations(k)
+            .map(|combo| format!("(and {})", combo.iter().join(" ")))
+            .collect();
+
+        let circuit = format!(
+            "(policy threshold_{k}_of_{n}_circuit\n    (or\n        {}))",
+            combinations.join("\n        ")
+        );
+
+        println!("Policy circuit:\n{}", circuit);
+
+        let compiler = Compiler::new();
+        let (_, expr) = parse(&circuit).unwrap();
+
+        // generate random keys for each party (A through O)
+        let test_keys = expr.generate_random_keys().unwrap();
+        let public_keys = test_keys
+            .iter()
+            .map(|(k, (_, pk))| (k.clone(), *pk))
+            .collect();
+
+        // initialize the compilation options
+        let options = CompilationOptions {
+            public_keys,
+            transform_to_cnf: true, // acquire the policy circuit to be in CNF form
+            aggregate: |points| {
+                musig2::aggregate_public_keys(&points, &DefaultMuSig2Hash::new()).unwrap()
+            }, // initialize the aggregate function of MuSig2 protocol
+            iota: |P: G1Affine| {
+                Fr::from_le_bytes_mod_order(&P.x().unwrap().into_bigint().to_bytes_le())
+            }, // initialize the iota function for DH
+        };
+
+        let policy = compiler.compile(&expr, options).unwrap();
+
+        println!("raw_policy: {}", policy);
+        // Resolve with k signers (first k parties)
+        let signing_parties = parties[..k].to_vec();
+        let mut resolved_policy = policy;
+        for party in &parties {
+            resolved_policy = resolved_policy.resolve(test_keys[*party].0).unwrap();
+        }
+
+        println!("resolved_policy: {}", resolved_policy);
+
+        let message = b"test_message_11_of_15";
+
+        // Debug: print all clause public keys
+        let all_clause_pks = resolved_policy.get_clauses_public_keys().unwrap();
+        println!("Total clause public keys: {}", all_clause_pks.len());
+        for (i, pk) in all_clause_pks.iter().enumerate() {
+            println!("  clause_pk[{}]: {:?}", i, pk);
+        }
+
+        // create signers for the k participating parties
+        let mut signers: Vec<Signer<G1Affine, DefaultMuSig2Hash<Fr>>> = signing_parties
+            .iter()
+            .map(|party| {
+                let signer = Signer::new(
+                    format!("Signer_{}", party),
+                    test_keys[*party].0,
+                    &mut resolved_policy,
+                    message.into(),
+                    DefaultMuSig2Hash::new(),
+                )
+                .unwrap();
+                println!(
+                    "Signer {} has {} clause keys",
+                    party,
+                    signer.clauses_keys.len()
+                );
+                for (i, (_, pk)) in signer.clauses_keys.iter().enumerate() {
+                    let in_clause_pks = all_clause_pks.contains(pk);
+                    println!(
+                        "  clause_key[{}]: {:?} (in clause_pks: {})",
+                        i, pk, in_clause_pks
+                    );
+                }
+                signer
+            })
+            .collect();
+
+        // Generate nonces for all signers
+        let all_nonces: Vec<Vec<(G1Affine, (G1Affine, G1Affine))>> = signers
+            .iter_mut()
+            .map(|s| s.generate_nonces(&mut thread_rng()).unwrap())
+            .collect();
+
+        // Process nonces: each signer receives nonces from all other signers
+        for i in 0..signers.len() {
+            for j in 0..signers.len() {
+                if i != j {
+                    for (key, nonces) in &all_nonces[j] {
+                        signers[i].process_nonces(*key, *nonces).unwrap();
+                    }
+                }
+            }
+        }
+
+        // Aggregate nonces for all signers and verify they match
+        let aggregated_nonces: Vec<G1Affine> = signers
+            .iter_mut()
+            .map(|s| s.aggregate_nonces().unwrap())
+            .collect();
+
+        // Verify all aggregated nonces are equal
+        let first_nonce = aggregated_nonces[0];
+        for nonce in &aggregated_nonces {
+            assert_eq!(*nonce, first_nonce, "Aggregated nonces should be equal");
+        }
+
+        // Sign the message with all signers
+        let all_signatures: Vec<Vec<Fr>> = signers.iter_mut().map(|s| s.sign().unwrap()).collect();
+
+        // Combine all partial signatures
+        let combined_sig =
+            aggregate_partial_signatures(&all_signatures.concat(), first_nonce).unwrap();
+
+        // Aggregated public key is obtained from the root node of the resolved policy tree
+        let aggregated_public_key = resolved_policy.get_public_key().unwrap();
+
+        // Verify the signature using the aggregated public key
+        let verified = verify_signature(
+            aggregated_public_key,
+            message,
+            &combined_sig,
+            &DefaultMuSig2Hash::new(),
+        )
+        .unwrap();
+
+        println!("Verification result: {}", verified);
+        assert!(verified, "Signature verification should succeed");
+    }
+
+    #[test]
+    fn test_threshold_signature() {
+        test_policy_k_of_n_signature(3, 5);
+    }
+
+    #[test]
+    fn test_policy_11_of_15_signature() {
+        test_policy_k_of_n_signature(11, 15);
     }
 }

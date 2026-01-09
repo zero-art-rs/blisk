@@ -223,7 +223,7 @@ impl<G: AffineRepr> PolicyTree<G> {
                     false => Ok((None, Some(u))),
                 }
             }
-            PolicyNode::OrGate(_) => {
+            PolicyNode::OrGate(existing_key) => {
                 if root.get_children_ids().unwrap().len() != 2 {
                     return Err(PolicyError::ResolutionError(
                         "OR gate must have exactly 2 childs".into(),
@@ -246,6 +246,8 @@ impl<G: AffineRepr> PolicyTree<G> {
                 if let Some(s_a) = s_a
                     && let Some(Q_b) = Q_b
                 {
+                    // Left child has secret, right child has public key
+                    // Compute derived key using DH
                     let s = (self.iota)((Q_b * s_a).into_affine());
                     let Q = (G::generator() * s).into_affine();
                     root.update_value(|x| *x = Some(PolicyNode::OrGate(Some(Q))))
@@ -254,11 +256,25 @@ impl<G: AffineRepr> PolicyTree<G> {
                 } else if let Some(s_b) = s_b
                     && let Some(Q_a) = Q_a
                 {
+                    // Right child has secret, left child has public key
+                    // Compute derived key using DH
                     let s = (self.iota)((Q_a * s_b).into_affine());
                     let Q = (G::generator() * s).into_affine();
                     root.update_value(|x| *x = Some(PolicyNode::OrGate(Some(Q))))
                         .unwrap();
                     Ok((Some(s), Some(Q)))
+                } else if let Some(Q_a) = Q_a
+                    && let Some(Q_b) = Q_b
+                {
+                    // Neither child has secret key, but both have public keys.
+                    // Return aggregated public key WITHOUT storing it in the tree.
+                    // This allows parent gates to compute derived keys, but doesn't
+                    // overwrite keys that should be set by other signers.
+                    let Q = (self.aggregate)(vec![Q_a, Q_b]);
+                    Ok((None, Some(Q)))
+                } else if let Some(Q) = existing_key {
+                    // Gate already has a key from previous resolution
+                    Ok((None, Some(Q)))
                 } else {
                     Ok((None, None))
                 }

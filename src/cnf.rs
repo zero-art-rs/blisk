@@ -27,9 +27,10 @@ impl PolicyExpr {
             PolicyExpr::Key(_) => true,
 
             // An OR of keys is a clause, which is in CNF
+            // Also supports nested/binary OR trees that only contain keys
             PolicyExpr::Or(subs) => {
-                // Check that all subexpressions are keys (literals)
-                subs.iter().all(|sub| matches!(sub, PolicyExpr::Key(_)))
+                // Check that all subexpressions are keys or nested ORs of keys
+                subs.iter().all(|sub| Self::is_or_of_keys(sub))
             }
 
             // An AND of clauses is in CNF if each clause is an OR of keys
@@ -43,10 +44,8 @@ impl PolicyExpr {
                         // A key within an AND is a degenerate clause (OR with one element)
                         PolicyExpr::Key(_) => true,
 
-                        // An OR within an AND must only contain keys
-                        PolicyExpr::Or(or_subs) => or_subs
-                            .iter()
-                            .all(|or_sub| matches!(or_sub, PolicyExpr::Key(_))),
+                        // An OR within an AND must only contain keys (or nested ORs of keys)
+                        PolicyExpr::Or(_) => Self::is_or_of_keys(sub),
 
                         // Any other expression within an AND means it's not in CNF
                         _ => false,
@@ -58,6 +57,16 @@ impl PolicyExpr {
             PolicyExpr::Policy { expr, .. } => expr.is_cnf(),
 
             // NOT, Threshold, and WeightedThreshold are not in CNF
+            _ => false,
+        }
+    }
+
+    /// Helper function to check if an expression is an OR clause containing only keys
+    /// Supports nested/binary OR trees (e.g., Or([Or([A, B]), Or([C, D])]))
+    fn is_or_of_keys(expr: &PolicyExpr) -> bool {
+        match expr {
+            PolicyExpr::Key(_) => true,
+            PolicyExpr::Or(subs) => subs.iter().all(|sub| Self::is_or_of_keys(sub)),
             _ => false,
         }
     }
@@ -486,9 +495,10 @@ mod tests {
         let (_, expr6) = parser::parse("(not A)").unwrap();
         assert!(!expr6.is_cnf());
 
-        // Test nested OR (should not be CNF)
+        // Test nested OR of keys (binary OR tree) - this IS valid CNF (a clause)
+        // because it's semantically equivalent to (or A B C)
         let (_, expr7) = parser::parse("(or A (or B C))").unwrap();
-        assert!(!expr7.is_cnf());
+        assert!(expr7.is_cnf(), "Nested OR of keys is a valid CNF clause");
 
         // Test nested AND in OR (should not be CNF)
         let (_, expr8) = parser::parse("(or A (and B C))").unwrap();
@@ -497,6 +507,79 @@ mod tests {
         // Test threshold (should not be CNF)
         let (_, expr9) = parser::parse("(threshold 2 A B C)").unwrap();
         assert!(!expr9.is_cnf());
+
+        // Test OR of ANDs (DNF form, should NOT be CNF)
+        let (_, expr10) =
+            parser::parse("(or (and A B C) (and A B D) (and A C D) (and B C D))").unwrap();
+        assert!(!expr10.is_cnf(), "OR of ANDs is DNF, not CNF");
+
+        // Test OR of ANDs in a named policy (should NOT be CNF)
+        let (_, expr11) = parser::parse(
+            "(policy threshold_3_of_4 (or (and A B C) (and A B D) (and A C D) (and B C D)))",
+        )
+        .unwrap();
+        assert!(
+            !expr11.is_cnf(),
+            "Named policy with OR of ANDs is DNF, not CNF"
+        );
+    }
+
+    #[test]
+    fn test_to_cnf_result_is_cnf() {
+        // Test that to_cnf() produces valid CNF for various DNF inputs
+
+        // Simple DNF: (or (and A B) (and C D))
+        let (_, expr1) = parser::parse("(or (and A B) (and C D))").unwrap();
+        assert!(!expr1.is_cnf(), "Original should be DNF, not CNF");
+        let cnf1 = expr1.to_cnf().unwrap();
+        assert!(
+            cnf1.is_cnf(),
+            "After to_cnf(), result should be CNF: {:?}",
+            cnf1
+        );
+
+        // 3-of-4 threshold as DNF
+        let (_, expr2) =
+            parser::parse("(or (and A B C) (and A B D) (and A C D) (and B C D))").unwrap();
+        assert!(!expr2.is_cnf(), "Original 3-of-4 should be DNF");
+        let cnf2 = expr2.to_cnf().unwrap();
+        assert!(
+            cnf2.is_cnf(),
+            "After to_cnf(), 3-of-4 result should be CNF: {:?}",
+            cnf2
+        );
+
+        // Named policy with DNF
+        let (_, expr3) = parser::parse(
+            "(policy test_policy (or (and A B C) (and A B D) (and A C D) (and B C D)))",
+        )
+        .unwrap();
+        assert!(!expr3.is_cnf(), "Original named policy should be DNF");
+        let cnf3 = expr3.to_cnf().unwrap();
+        assert!(
+            cnf3.is_cnf(),
+            "After to_cnf(), named policy result should be CNF: {:?}",
+            cnf3
+        );
+
+        // Already CNF should stay CNF
+        let (_, expr4) = parser::parse("(and (or A B) (or C D))").unwrap();
+        assert!(expr4.is_cnf(), "Original should already be CNF");
+        let cnf4 = expr4.to_cnf().unwrap();
+        assert!(cnf4.is_cnf(), "After to_cnf(), should still be CNF");
+    }
+
+    #[test]
+    fn test_cnf_transform_3_of_5() {
+        // Test 3-of-5 threshold CNF transformation
+        let policy_3_of_5 = "(or (and A B C) (and A B D) (and A B E) (and A C D) (and A C E) (and A D E) (and B C D) (and B C E) (and B D E) (and C D E))";
+        let (_, expr) = parser::parse(policy_3_of_5).unwrap();
+        println!("Original 3-of-5 DNF: {:?}", expr);
+
+        let cnf = expr.to_cnf().unwrap();
+        println!("CNF result for 3-of-5:\n{:#?}", cnf);
+
+        assert!(cnf.is_cnf(), "Result should be valid CNF");
     }
 
     #[test]
