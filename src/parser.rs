@@ -6,6 +6,7 @@ use nom::{
     multi::separated_list0,
     sequence::{delimited, preceded},
 };
+use std::fmt::{self, Display};
 
 #[derive(Debug, Clone, PartialEq, Hash, Eq)]
 pub enum PolicyExpr {
@@ -129,4 +130,46 @@ fn weighted_sub(input: &str) -> IResult<&str, (PolicyExpr, u32)> {
         preceded(multispace0, char(')')),
     )
     .parse(input)
+}
+
+impl Display for PolicyExpr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PolicyExpr::Key(name) => write!(f, "{}", name),
+            PolicyExpr::And(subs) => {
+                write!(f, "(and")?;
+                for sub in subs {
+                    write!(f, " {}", sub)?;
+                }
+                write!(f, ")")
+            }
+            PolicyExpr::Or(subs) => {
+                write!(f, "(or")?;
+                for sub in subs {
+                    write!(f, " {}", sub)?;
+                }
+                write!(f, ")")
+            }
+            PolicyExpr::Not(inner) => {
+                write!(f, "(not {})", inner)
+            }
+            PolicyExpr::Threshold { k, subs } => {
+                write!(f, "(threshold {}", k)?;
+                for sub in subs {
+                    write!(f, " {}", sub)?;
+                }
+                write!(f, ")")
+            }
+            PolicyExpr::WeightedThreshold { k, subs } => {
+                write!(f, "(weighted-threshold {}", k)?;
+                for (sub, weight) in subs {
+                    write!(f, " ({} {})", sub, weight)?;
+                }
+                write!(f, ")")
+            }
+            PolicyExpr::Policy { name, expr } => {
+                write!(f, "(policy {} {})", name, expr)
+            }
+        }
+    }
 }

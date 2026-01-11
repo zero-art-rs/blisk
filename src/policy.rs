@@ -1,4 +1,5 @@
 use crate::errors::PolicyError;
+use crate::parser::PolicyExpr;
 use ark_ec::AffineRepr;
 use ark_ec::CurveGroup;
 use ark_ff::{BigInt, BigInteger, Field, PrimeField, UniformRand};
@@ -105,6 +106,84 @@ impl<G: AffineRepr> PolicyTree<G> {
             .get_value()
             .unwrap()
             .is_some()
+    }
+
+    /// Returns the total number of children of the root AND gate (total number of clauses)
+    pub fn get_clauses_count(&self) -> Result<usize, PolicyError> {
+        if !self.is_cnf {
+            return Err(PolicyError::NotCNF);
+        }
+        Ok(self
+            .tree
+            .get_root_node()
+            .unwrap()
+            .get_children_ids()
+            .unwrap()
+            .len())
+    }
+
+    /// Returns the maximum total number of nodes among all clauses (children of the top-level AND gate)
+    pub fn get_maximal_clause_depth(&self) -> Result<usize, PolicyError> {
+        if !self.is_cnf {
+            return Err(PolicyError::NotCNF);
+        }
+
+        fn count_nodes<G: AffineRepr>(
+            tree: &Tree<u64, PolicyNode<G>>,
+            node: &Node<u64, PolicyNode<G>>,
+        ) -> usize {
+            let children_ids = node.get_children_ids().unwrap();
+            1 + children_ids
+                .iter()
+                .map(|child_id| count_nodes(tree, &tree.get_node_by_id(child_id).unwrap()))
+                .sum::<usize>()
+        }
+
+        let max_nodes = self
+            .tree
+            .get_root_node()
+            .unwrap()
+            .get_children_ids()
+            .unwrap()
+            .iter()
+            .map(|child_id| count_nodes(&self.tree, &self.tree.get_node_by_id(child_id).unwrap()))
+            .max()
+            .unwrap_or(0);
+
+        Ok(max_nodes)
+    }
+
+    /// Converts the PolicyTree back to a PolicyExpr
+    pub fn to_expr(&self) -> PolicyExpr {
+        fn node_to_expr<G: AffineRepr>(
+            tree: &Tree<u64, PolicyNode<G>>,
+            node: &Node<u64, PolicyNode<G>>,
+        ) -> PolicyExpr {
+            match node.get_value().unwrap().unwrap() {
+                PolicyNode::UserKey((label, _)) => PolicyExpr::Key(label),
+                PolicyNode::AndGate(_) => {
+                    let children: Vec<PolicyExpr> = node
+                        .get_children_ids()
+                        .unwrap()
+                        .iter()
+                        .map(|child_id| node_to_expr(tree, &tree.get_node_by_id(child_id).unwrap()))
+                        .collect();
+                    PolicyExpr::And(children)
+                }
+                PolicyNode::OrGate(_) => {
+                    let children: Vec<PolicyExpr> = node
+                        .get_children_ids()
+                        .unwrap()
+                        .iter()
+                        .map(|child_id| node_to_expr(tree, &tree.get_node_by_id(child_id).unwrap()))
+                        .collect();
+                    PolicyExpr::Or(children)
+                }
+                PolicyNode::Empty => PolicyExpr::Key("__empty__".to_string()),
+            }
+        }
+
+        node_to_expr(&self.tree, &self.tree.get_root_node().unwrap())
     }
 
     pub fn get_clauses_public_keys(&self) -> Result<Vec<G>, PolicyError> {
@@ -223,7 +302,7 @@ impl<G: AffineRepr> PolicyTree<G> {
                     false => Ok((None, Some(u))),
                 }
             }
-            PolicyNode::OrGate(_) => {
+            PolicyNode::OrGate(existing_key) => {
                 if root.get_children_ids().unwrap().len() != 2 {
                     return Err(PolicyError::ResolutionError(
                         "OR gate must have exactly 2 childs".into(),
@@ -246,6 +325,8 @@ impl<G: AffineRepr> PolicyTree<G> {
                 if let Some(s_a) = s_a
                     && let Some(Q_b) = Q_b
                 {
+                    // Left child has secret, right child has public key
+                    // Compute derived key using DH
                     let s = (self.iota)((Q_b * s_a).into_affine());
                     let Q = (G::generator() * s).into_affine();
                     root.update_value(|x| *x = Some(PolicyNode::OrGate(Some(Q))))
@@ -254,11 +335,16 @@ impl<G: AffineRepr> PolicyTree<G> {
                 } else if let Some(s_b) = s_b
                     && let Some(Q_a) = Q_a
                 {
+                    // Right child has secret, left child has public key
+                    // Compute derived key using DH
                     let s = (self.iota)((Q_a * s_b).into_affine());
                     let Q = (G::generator() * s).into_affine();
                     root.update_value(|x| *x = Some(PolicyNode::OrGate(Some(Q))))
                         .unwrap();
                     Ok((Some(s), Some(Q)))
+                } else if let Some(Q) = existing_key {
+                    // Gate already has a key from previous resolution
+                    Ok((None, Some(Q)))
                 } else {
                     Ok((None, None))
                 }
@@ -351,6 +437,8 @@ mod tests {
                 iota,
             };
             let policy = compiler.compile(&expr, options).unwrap();
+            let expr_compiled = policy.to_expr();
+            println!("Compiled Expression: {}", expr_compiled);
             let resolved_policy = policy.resolve(test_keys["A"].0).unwrap();
             println!("{:}", resolved_policy);
         }
