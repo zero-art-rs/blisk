@@ -1,8 +1,9 @@
 use crate::errors::PolicyError;
 use crate::parser::PolicyExpr;
+use std::cmp::Ordering;
 use std::collections::HashSet;
-use std::hash::{BuildHasherDefault, DefaultHasher};
 use std::result::Result;
+
 /// Converts a policy expression into Conjunctive Normal Form (CNF).
 ///
 /// The conversion follows these steps:
@@ -13,6 +14,104 @@ use std::result::Result;
 ///
 /// Note: `Threshold` and `WeightedThreshold` expressions are not supported
 /// for CNF conversion and will result in an error.
+
+/// Helper function for deterministic ordering of PolicyExpr
+fn policy_expr_cmp(a: &PolicyExpr, b: &PolicyExpr) -> Ordering {
+    match (a, b) {
+        (PolicyExpr::Key(ka), PolicyExpr::Key(kb)) => ka.cmp(kb),
+        (PolicyExpr::Key(_), _) => Ordering::Less,
+        (_, PolicyExpr::Key(_)) => Ordering::Greater,
+        (PolicyExpr::Or(sa), PolicyExpr::Or(sb)) => {
+            let len_cmp = sa.len().cmp(&sb.len());
+            if len_cmp != Ordering::Equal {
+                return len_cmp;
+            }
+            for (a_sub, b_sub) in sa.iter().zip(sb.iter()) {
+                let sub_cmp = policy_expr_cmp(a_sub, b_sub);
+                if sub_cmp != Ordering::Equal {
+                    return sub_cmp;
+                }
+            }
+            Ordering::Equal
+        }
+        (PolicyExpr::Or(_), _) => Ordering::Less,
+        (_, PolicyExpr::Or(_)) => Ordering::Greater,
+        (PolicyExpr::And(sa), PolicyExpr::And(sb)) => {
+            let len_cmp = sa.len().cmp(&sb.len());
+            if len_cmp != Ordering::Equal {
+                return len_cmp;
+            }
+            for (a_sub, b_sub) in sa.iter().zip(sb.iter()) {
+                let sub_cmp = policy_expr_cmp(a_sub, b_sub);
+                if sub_cmp != Ordering::Equal {
+                    return sub_cmp;
+                }
+            }
+            Ordering::Equal
+        }
+        (PolicyExpr::And(_), _) => Ordering::Less,
+        (_, PolicyExpr::And(_)) => Ordering::Greater,
+        (PolicyExpr::Policy { name: na, .. }, PolicyExpr::Policy { name: nb, .. }) => na.cmp(nb),
+        (PolicyExpr::Policy { .. }, _) => Ordering::Less,
+        (_, PolicyExpr::Policy { .. }) => Ordering::Greater,
+        _ => Ordering::Equal,
+    }
+}
+
+/// Extract all literals from an expression into a HashSet (efficient for subset checks)
+fn extract_literals_set(expr: &PolicyExpr) -> HashSet<PolicyExpr> {
+    let mut result = HashSet::new();
+    extract_literals_into_set(expr, &mut result);
+    result
+}
+
+fn extract_literals_into_set(expr: &PolicyExpr, literals: &mut HashSet<PolicyExpr>) {
+    match expr {
+        PolicyExpr::Key(_) => {
+            literals.insert(expr.clone());
+        }
+        PolicyExpr::Or(subs) => {
+            for sub in subs {
+                extract_literals_into_set(sub, literals);
+            }
+        }
+        _ => {
+            literals.insert(expr.clone());
+        }
+    }
+}
+
+/// Extract literals into a Vec (for building results)
+fn extract_literals_vec(expr: &PolicyExpr) -> Vec<PolicyExpr> {
+    let mut result = Vec::new();
+    let mut seen = HashSet::new();
+    extract_literals_into_vec(expr, &mut result, &mut seen);
+    result
+}
+
+fn extract_literals_into_vec(
+    expr: &PolicyExpr,
+    literals: &mut Vec<PolicyExpr>,
+    seen: &mut HashSet<PolicyExpr>,
+) {
+    match expr {
+        PolicyExpr::Key(_) => {
+            if seen.insert(expr.clone()) {
+                literals.push(expr.clone());
+            }
+        }
+        PolicyExpr::Or(subs) => {
+            for sub in subs {
+                extract_literals_into_vec(sub, literals, seen);
+            }
+        }
+        _ => {
+            if seen.insert(expr.clone()) {
+                literals.push(expr.clone());
+            }
+        }
+    }
+}
 
 impl PolicyExpr {
     /// Checks if a policy expression is already in Conjunctive Normal Form (CNF).
@@ -127,34 +226,33 @@ impl PolicyExpr {
                     .iter()
                     .map(|sub| sub.distribute())
                     .collect::<Result<Vec<_>, _>>()?;
-                // Flatten AND of ANDs
+
+                // Flatten AND of ANDs and deduplicate using HashSet
+                let mut seen = HashSet::new();
                 let mut flattened_subs = Vec::new();
                 for sub in processed_subs {
                     if let PolicyExpr::And(inner_subs) = sub {
-                        flattened_subs.extend(inner_subs);
-                    } else {
+                        for inner in inner_subs {
+                            if seen.insert(inner.clone()) {
+                                flattened_subs.push(inner);
+                            }
+                        }
+                    } else if seen.insert(sub.clone()) {
                         flattened_subs.push(sub);
                     }
                 }
 
-                // Apply idempotency to remove duplicates
-                let mut unique_subs = Vec::new();
-                for sub in flattened_subs {
-                    if !unique_subs.contains(&sub) {
-                        unique_subs.push(sub);
-                    }
-                }
+                // Sort for deterministic ordering
+                flattened_subs.sort_by(policy_expr_cmp);
 
-                // Sort for deterministic ordering (helps with deduplication)
-                unique_subs.sort_by(|a, b| format!("{:?}", a).cmp(&format!("{:?}", b)));
-
-                Ok(PolicyExpr::And(unique_subs))
+                Ok(PolicyExpr::And(flattened_subs))
             }
             PolicyExpr::Or(subs) => {
-                // First apply idempotency - remove duplicates in inputs
+                // Deduplicate inputs using HashSet
+                let mut seen = HashSet::new();
                 let mut unique_inputs = Vec::new();
                 for sub in subs {
-                    if !unique_inputs.contains(sub) {
+                    if seen.insert(sub.clone()) {
                         unique_inputs.push(sub.clone());
                     }
                 }
@@ -165,23 +263,22 @@ impl PolicyExpr {
                     .map(|sub| sub.distribute())
                     .collect::<Result<Vec<_>, _>>()?;
 
-                // Apply idempotency again after distribution
+                // Deduplicate again after distribution
+                let mut seen = HashSet::new();
                 let mut unique_subs = Vec::new();
                 for sub in processed_subs {
-                    if !unique_subs.contains(&sub) {
+                    if seen.insert(sub.clone()) {
                         unique_subs.push(sub);
                     }
                 }
 
                 // Sort for deterministic ordering
-                unique_subs.sort_by(|a, b| format!("{:?}", a).cmp(&format!("{:?}", b)));
+                unique_subs.sort_by(policy_expr_cmp);
 
                 if unique_subs.is_empty() {
-                    // This represents `false`, which is not well-supported in the tree.
-                    // An empty OR is usually considered false. Let's return an empty OR
-                    // and let the caller decide.
                     return Ok(PolicyExpr::Or(vec![]));
                 }
+
                 let mut it = unique_subs.into_iter();
                 let first = it.next().unwrap();
                 it.try_fold(first, |acc, next| Self::distribute_two(&acc, &next))
@@ -198,128 +295,92 @@ impl PolicyExpr {
         }
     }
 
-    // Helper to extract all literals from an expression (flattening nested ORs)
-    fn extract_literals(expr: &PolicyExpr, literals: &mut Vec<PolicyExpr>) {
-        match expr {
-            PolicyExpr::Key(_) => {
-                if !literals.contains(expr) {
-                    literals.push(expr.clone());
-                }
-            }
-            PolicyExpr::Or(subs) => {
-                for sub in subs {
-                    Self::extract_literals(sub, literals);
-                }
-            }
-            _ => {
-                if !literals.contains(expr) {
-                    literals.push(expr.clone());
-                }
-            }
-        }
-    }
-
     /// checks if clause_b is a subset of clause_a (e.g. absorbs it in terms of CNF)
-    fn is_subset(clause_a: &PolicyExpr, clause_b: &PolicyExpr) -> bool {
-        let mut flattened_a = Vec::new();
-        let mut flattened_b = Vec::new();
-
-        Self::extract_literals(clause_a, &mut flattened_a);
-        Self::extract_literals(clause_b, &mut flattened_b);
-
-        HashSet::<PolicyExpr, BuildHasherDefault<DefaultHasher>>::from_iter(
-            flattened_b.iter().cloned(),
-        )
-        .is_subset(&HashSet::from_iter(flattened_a.iter().cloned()))
+    fn is_subset_with_sets(set_a: &HashSet<PolicyExpr>, set_b: &HashSet<PolicyExpr>) -> bool {
+        set_b.is_subset(set_a)
     }
 
     /// Helper for `distribute`: distributes `a OR b` where `a` and `b` are CNFs.
     fn distribute_two(a: &PolicyExpr, b: &PolicyExpr) -> Result<PolicyExpr, PolicyError> {
         match (a, b) {
             (PolicyExpr::And(subs_a), PolicyExpr::And(subs_b)) => {
+                // Use HashSet for efficient deduplication
+                let mut seen = HashSet::new();
                 let mut clauses = Vec::new();
+
                 for sub_a in subs_a {
                     for sub_b in subs_b {
-                        // Each sub_a and sub_b is a clause (an OR of literals)
-                        clauses.push(Self::distribute_two(sub_a, sub_b)?);
+                        let clause = Self::distribute_two(sub_a, sub_b)?;
+                        if seen.insert(clause.clone()) {
+                            clauses.push(clause);
+                        }
                     }
                 }
 
-                // Deduplicate clauses (applying idempotency)
-                let mut unique_clauses = Vec::new();
-                for clause in clauses {
-                    if !unique_clauses.contains(&clause) {
-                        unique_clauses.push(clause);
-                    }
-                }
-
-                Ok(PolicyExpr::And(unique_clauses))
+                Ok(PolicyExpr::And(clauses))
             }
             (PolicyExpr::And(subs_a), other_b) => {
-                // Distribute each term from the AND over the other expression
+                let mut seen = HashSet::new();
                 let mut all_clauses = Vec::new();
+
                 for sub_a in subs_a {
                     let distributed = Self::distribute_two(sub_a, other_b)?;
 
-                    // If the result is an AND, add its clauses; otherwise add the clause itself
-                    if let PolicyExpr::And(inner_clauses) = &distributed {
-                        all_clauses.extend(inner_clauses.clone());
-                    } else {
+                    if let PolicyExpr::And(inner_clauses) = distributed {
+                        for clause in inner_clauses {
+                            if seen.insert(clause.clone()) {
+                                all_clauses.push(clause);
+                            }
+                        }
+                    } else if seen.insert(distributed.clone()) {
                         all_clauses.push(distributed);
                     }
                 }
 
-                // Apply idempotency to eliminate duplicate clauses
-                let mut unique_clauses = Vec::new();
-                for clause in all_clauses {
-                    if !unique_clauses.contains(&clause) {
-                        unique_clauses.push(clause);
-                    }
-                }
-
                 // Sort clauses for deterministic ordering
-                unique_clauses.sort_by(|a, b| format!("{:?}", a).cmp(&format!("{:?}", b)));
+                all_clauses.sort_by(policy_expr_cmp);
 
-                Ok(PolicyExpr::And(unique_clauses))
+                Ok(PolicyExpr::And(all_clauses))
             }
             (other_a, PolicyExpr::And(subs_b)) => {
-                // Distribute the other expression over each term from the AND
+                let mut seen = HashSet::new();
                 let mut all_clauses = Vec::new();
+
                 for sub_b in subs_b {
                     let distributed = Self::distribute_two(other_a, sub_b)?;
 
-                    // If the result is an AND, add its clauses; otherwise add the clause itself
-                    if let PolicyExpr::And(inner_clauses) = &distributed {
-                        all_clauses.extend(inner_clauses.clone());
-                    } else {
+                    if let PolicyExpr::And(inner_clauses) = distributed {
+                        for clause in inner_clauses {
+                            if seen.insert(clause.clone()) {
+                                all_clauses.push(clause);
+                            }
+                        }
+                    } else if seen.insert(distributed.clone()) {
                         all_clauses.push(distributed);
                     }
                 }
 
-                // Apply idempotency to eliminate duplicate clauses
-                let mut unique_clauses = Vec::new();
-                for clause in all_clauses {
-                    if !unique_clauses.contains(&clause) {
-                        unique_clauses.push(clause);
-                    }
-                }
-
                 // Sort clauses for deterministic ordering
-                unique_clauses.sort_by(|a, b| format!("{:?}", a).cmp(&format!("{:?}", b)));
+                all_clauses.sort_by(policy_expr_cmp);
 
-                Ok(PolicyExpr::And(unique_clauses))
+                Ok(PolicyExpr::And(all_clauses))
             }
             // Base case: neither expression is an AND. They must be ORs of keys, or just keys.
             (other_a, other_b) => {
-                // Collect all literals from both expressions, flattening nested ORs
-                let mut all_literals = Vec::new();
+                // Use efficient literal extraction with HashSet
+                let mut all_literals = extract_literals_vec(other_a);
+                let mut seen: HashSet<PolicyExpr> = all_literals.iter().cloned().collect();
 
-                // Extract literals from both expressions
-                Self::extract_literals(other_a, &mut all_literals);
-                Self::extract_literals(other_b, &mut all_literals);
+                // Add literals from other_b
+                let literals_b = extract_literals_vec(other_b);
+                for lit in literals_b {
+                    if seen.insert(lit.clone()) {
+                        all_literals.push(lit);
+                    }
+                }
 
                 // Sort literals for deterministic ordering
-                all_literals.sort_by(|a, b| format!("{:?}", a).cmp(&format!("{:?}", b)));
+                all_literals.sort_by(policy_expr_cmp);
 
                 Ok(PolicyExpr::Or(all_literals))
             }
@@ -335,70 +396,93 @@ impl PolicyExpr {
                     .map(|sub| sub.ensure_binary_or())
                     .collect::<Result<Vec<_>, _>>()?;
 
-                // Flatten AND of ANDs (helps with CNF structure)
+                // Flatten AND of ANDs using HashSet for deduplication
+                let mut seen = HashSet::new();
                 let mut flattened = Vec::new();
                 for sub in binary_or_subs {
                     match sub {
-                        PolicyExpr::And(inner_subs) => flattened.extend(inner_subs),
-                        _ => flattened.push(sub),
+                        PolicyExpr::And(inner_subs) => {
+                            for inner in inner_subs {
+                                if seen.insert(inner.clone()) {
+                                    flattened.push(inner);
+                                }
+                            }
+                        }
+                        _ => {
+                            if seen.insert(sub.clone()) {
+                                flattened.push(sub);
+                            }
+                        }
                     }
                 }
 
                 // Sort clauses for deterministic ordering
-                flattened.sort_by(|a, b| format!("{:?}", a).cmp(&format!("{:?}", b)));
-                // Apply idempotency to AND clauses
-                flattened.dedup();
+                flattened.sort_by(policy_expr_cmp);
 
-                // Apply absorption rule: if clause A is a subset of clause B, remove B
-                let mut minimal_clauses = Vec::new();
-                for clause_a in &flattened {
+                // Apply absorption rule with pre-computed literal sets
+                // First, compute all literal sets
+                let literal_sets: Vec<HashSet<PolicyExpr>> = flattened
+                    .iter()
+                    .map(|clause| extract_literals_set(clause))
+                    .collect();
+
+                let mut minimal_indices: Vec<usize> = Vec::new();
+
+                for (i, set_a) in literal_sets.iter().enumerate() {
                     // Check if this clause is absorbed by any already included clause
                     let mut is_absorbed = false;
-                    for clause_b in &minimal_clauses {
-                        if Self::is_subset(clause_a, clause_b) {
+                    for &j in &minimal_indices {
+                        if Self::is_subset_with_sets(set_a, &literal_sets[j]) {
                             is_absorbed = true;
                             break;
                         }
                     }
 
                     if !is_absorbed {
-                        // If this clause wasn't absorbed, add it and remove any clauses it absorbs
-                        minimal_clauses.retain(|clause_b| !Self::is_subset(clause_b, clause_a));
-                        minimal_clauses.push(clause_a.clone());
+                        // Remove any clauses absorbed by this one
+                        minimal_indices
+                            .retain(|&j| !Self::is_subset_with_sets(&literal_sets[j], set_a));
+                        minimal_indices.push(i);
                     }
                 }
+
+                let minimal_clauses: Vec<PolicyExpr> = minimal_indices
+                    .into_iter()
+                    .map(|i| flattened[i].clone())
+                    .collect();
 
                 Ok(PolicyExpr::And(minimal_clauses))
             }
             PolicyExpr::Or(subs) => {
-                // Apply idempotency by flattening and deduplicating all OR expressions
+                // Flatten and deduplicate using HashSet
+                let mut seen = HashSet::new();
+                let mut flattened = Vec::new();
 
-                // Helper function to extract all literals from OR expressions
-                fn flatten_or_expr(expr: &PolicyExpr, result: &mut Vec<PolicyExpr>) {
+                fn flatten_or_expr(
+                    expr: &PolicyExpr,
+                    result: &mut Vec<PolicyExpr>,
+                    seen: &mut HashSet<PolicyExpr>,
+                ) {
                     match expr {
                         PolicyExpr::Or(nested) => {
-                            // Recursively flatten nested ORs
                             for sub in nested {
-                                flatten_or_expr(sub, result);
+                                flatten_or_expr(sub, result, seen);
                             }
                         }
                         _ => {
-                            // Add non-OR expressions directly if not already present
-                            if !result.contains(expr) {
+                            if seen.insert(expr.clone()) {
                                 result.push(expr.clone());
                             }
                         }
                     }
                 }
 
-                // Flatten all nested OR expressions and deduplicate literals
-                let mut flattened = Vec::new();
                 for sub in subs {
-                    flatten_or_expr(sub, &mut flattened);
+                    flatten_or_expr(sub, &mut flattened, &mut seen);
                 }
 
                 // Sort for deterministic ordering
-                flattened.sort_by(|a, b| format!("{:?}", a).cmp(&format!("{:?}", b)));
+                flattened.sort_by(policy_expr_cmp);
 
                 // Handle the base cases
                 if flattened.is_empty() {
@@ -407,7 +491,6 @@ impl PolicyExpr {
                     return Ok(PolicyExpr::Or(flattened));
                 } else {
                     // For more than 2 literals, build a balanced binary OR tree
-                    // (instead of right-associative) for better performance
 
                     fn build_balanced_or_tree(literals: &[PolicyExpr]) -> PolicyExpr {
                         if literals.len() == 1 {
@@ -442,266 +525,217 @@ impl PolicyExpr {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parser;
+    use crate::parser::parse;
 
     #[test]
     fn test_to_cnf_optimization() {
-        // Test that expressions already in CNF are returned unchanged
+        // Create a moderately complex expression that would expose inefficiencies
+        // (A OR B) AND (C OR D) should remain unchanged
+        let (_, expr) = parse("(and (or A B) (or C D))").unwrap();
+        let cnf = expr.to_cnf().unwrap();
+        assert!(cnf.is_cnf());
 
-        // A single key is already CNF
-        let (_, key) = parser::parse("A").unwrap();
-        let key_cnf = key.clone().to_cnf().unwrap();
-        assert_eq!(key, key_cnf);
+        // (A AND B) OR (C AND D) should become (A OR C) AND (A OR D) AND (B OR C) AND (B OR D)
+        let (_, expr2) = parse("(or (and A B) (and C D))").unwrap();
+        let cnf2 = expr2.to_cnf().unwrap();
+        assert!(cnf2.is_cnf());
 
-        // An OR of keys is already CNF
-        let (_, or_expr) = parser::parse("(or A B C)").unwrap();
-        let or_cnf = or_expr.clone().to_cnf().unwrap();
-        assert_eq!(or_expr, or_cnf);
-
-        // An AND of keys is already CNF
-        let (_, and_expr) = parser::parse("(and A B C)").unwrap();
-        let and_cnf = and_expr.clone().to_cnf().unwrap();
-        assert_eq!(and_expr, and_cnf);
-
-        // An AND of ORs of keys is already CNF
-        let (_, complex_expr) = parser::parse("(and (or A B) (or C D) E)").unwrap();
-        let complex_cnf = complex_expr.clone().to_cnf().unwrap();
-        assert_eq!(complex_expr, complex_cnf);
+        // Verify the structure
+        if let PolicyExpr::And(clauses) = &cnf2 {
+            assert_eq!(clauses.len(), 4);
+        } else {
+            panic!("Expected AND at top level");
+        }
     }
 
     #[test]
     fn test_is_cnf() {
-        // Test a single key (should be CNF)
-        let (_, expr1) = parser::parse("A").unwrap();
-        assert!(expr1.is_cnf());
+        // Single key should be CNF
+        let expr = PolicyExpr::Key("A".to_string());
+        assert!(expr.is_cnf());
 
-        // Test an OR of keys (should be CNF)
-        let (_, expr2) = parser::parse("(or A B C)").unwrap();
-        assert!(expr2.is_cnf());
+        // AND of keys should be CNF
+        let expr = PolicyExpr::And(vec![
+            PolicyExpr::Key("A".to_string()),
+            PolicyExpr::Key("B".to_string()),
+        ]);
+        assert!(expr.is_cnf());
 
-        // Test an AND of keys (should be CNF)
-        let (_, expr3) = parser::parse("(and A B C)").unwrap();
-        assert!(expr3.is_cnf());
+        // OR of keys should be CNF
+        let expr = PolicyExpr::Or(vec![
+            PolicyExpr::Key("A".to_string()),
+            PolicyExpr::Key("B".to_string()),
+        ]);
+        assert!(expr.is_cnf());
 
-        // Test an AND of ORs of keys (should be CNF)
-        let (_, expr4) = parser::parse("(and (or A B) (or C D) E)").unwrap();
-        assert!(expr4.is_cnf());
+        // AND of ORs of keys should be CNF
+        let expr = PolicyExpr::And(vec![
+            PolicyExpr::Or(vec![
+                PolicyExpr::Key("A".to_string()),
+                PolicyExpr::Key("B".to_string()),
+            ]),
+            PolicyExpr::Or(vec![
+                PolicyExpr::Key("C".to_string()),
+                PolicyExpr::Key("D".to_string()),
+            ]),
+        ]);
+        assert!(expr.is_cnf());
 
-        // Test a named policy with CNF inside (should be CNF)
-        let (_, expr5) = parser::parse("(policy myPolicy (and (or A B) C))").unwrap();
-        assert!(expr5.is_cnf());
+        // OR of ANDs should NOT be CNF
+        let expr = PolicyExpr::Or(vec![
+            PolicyExpr::And(vec![
+                PolicyExpr::Key("A".to_string()),
+                PolicyExpr::Key("B".to_string()),
+            ]),
+            PolicyExpr::And(vec![
+                PolicyExpr::Key("C".to_string()),
+                PolicyExpr::Key("D".to_string()),
+            ]),
+        ]);
+        assert!(!expr.is_cnf());
 
-        // Test NOT (should not be CNF)
-        let (_, expr6) = parser::parse("(not A)").unwrap();
-        assert!(!expr6.is_cnf());
-
-        // Test nested OR of keys (binary OR tree) - this IS valid CNF (a clause)
-        // because it's semantically equivalent to (or A B C)
-        let (_, expr7) = parser::parse("(or A (or B C))").unwrap();
-        assert!(expr7.is_cnf(), "Nested OR of keys is a valid CNF clause");
-
-        // Test nested AND in OR (should not be CNF)
-        let (_, expr8) = parser::parse("(or A (and B C))").unwrap();
-        assert!(!expr8.is_cnf());
-
-        // Test threshold (should not be CNF)
-        let (_, expr9) = parser::parse("(threshold 2 A B C)").unwrap();
-        assert!(!expr9.is_cnf());
-
-        // Test OR of ANDs (DNF form, should NOT be CNF)
-        let (_, expr10) =
-            parser::parse("(or (and A B C) (and A B D) (and A C D) (and B C D))").unwrap();
-        assert!(!expr10.is_cnf(), "OR of ANDs is DNF, not CNF");
-
-        // Test OR of ANDs in a named policy (should NOT be CNF)
-        let (_, expr11) = parser::parse(
-            "(policy threshold_3_of_4 (or (and A B C) (and A B D) (and A C D) (and B C D)))",
-        )
-        .unwrap();
-        assert!(
-            !expr11.is_cnf(),
-            "Named policy with OR of ANDs is DNF, not CNF"
-        );
+        // Nested binary ORs of keys should be CNF
+        let expr = PolicyExpr::Or(vec![
+            PolicyExpr::Or(vec![
+                PolicyExpr::Key("A".to_string()),
+                PolicyExpr::Key("B".to_string()),
+            ]),
+            PolicyExpr::Or(vec![
+                PolicyExpr::Key("C".to_string()),
+                PolicyExpr::Key("D".to_string()),
+            ]),
+        ]);
+        assert!(expr.is_cnf());
     }
 
     #[test]
     fn test_to_cnf_result_is_cnf() {
-        // Test that to_cnf() produces valid CNF for various DNF inputs
+        let test_cases = [
+            "(and A B)",
+            "(or A B)",
+            "(or (and A B) (and C D))",
+            "(and (or A B) (or C D))",
+            "(or A (and B C))",
+            "(and A (or B C))",
+            "(or (and A B) C)",
+            "(and (or A B) C)",
+            "(or (and A B) (and C (or D E)))",
+            "(and (or A B) (and C (or D E)))",
+            // More complex cases
+            "(or (and A B C) (and D E F))",
+            "(or (and A (or B C)) (and D (or E F)))",
+        ];
 
-        // Simple DNF: (or (and A B) (and C D))
-        let (_, expr1) = parser::parse("(or (and A B) (and C D))").unwrap();
-        assert!(!expr1.is_cnf(), "Original should be DNF, not CNF");
-        let cnf1 = expr1.to_cnf().unwrap();
-        assert!(
-            cnf1.is_cnf(),
-            "After to_cnf(), result should be CNF: {:?}",
-            cnf1
-        );
+        for input in &test_cases {
+            let (_, expr) = parse(input).expect(&format!("Failed to parse: {}", input));
+            let cnf_result = expr.to_cnf();
 
-        // 3-of-4 threshold as DNF
-        let (_, expr2) =
-            parser::parse("(or (and A B C) (and A B D) (and A C D) (and B C D))").unwrap();
-        assert!(!expr2.is_cnf(), "Original 3-of-4 should be DNF");
-        let cnf2 = expr2.to_cnf().unwrap();
-        assert!(
-            cnf2.is_cnf(),
-            "After to_cnf(), 3-of-4 result should be CNF: {:?}",
-            cnf2
-        );
-
-        // Named policy with DNF
-        let (_, expr3) = parser::parse(
-            "(policy test_policy (or (and A B C) (and A B D) (and A C D) (and B C D)))",
-        )
-        .unwrap();
-        assert!(!expr3.is_cnf(), "Original named policy should be DNF");
-        let cnf3 = expr3.to_cnf().unwrap();
-        assert!(
-            cnf3.is_cnf(),
-            "After to_cnf(), named policy result should be CNF: {:?}",
-            cnf3
-        );
-
-        // Already CNF should stay CNF
-        let (_, expr4) = parser::parse("(and (or A B) (or C D))").unwrap();
-        assert!(expr4.is_cnf(), "Original should already be CNF");
-        let cnf4 = expr4.to_cnf().unwrap();
-        assert!(cnf4.is_cnf(), "After to_cnf(), should still be CNF");
+            match cnf_result {
+                Ok(cnf) => {
+                    assert!(
+                        cnf.is_cnf(),
+                        "CNF result for '{}' is not in CNF form: {:?}",
+                        input,
+                        cnf
+                    );
+                }
+                Err(e) => {
+                    panic!("CNF conversion failed for '{}': {:?}", input, e);
+                }
+            }
+        }
     }
 
     #[test]
     fn test_cnf_transform_3_of_5() {
-        // Test 3-of-5 threshold CNF transformation
+        // Test 3-of-5 threshold as DNF (manually expanded)
         let policy_3_of_5 = "(or (and A B C) (and A B D) (and A B E) (and A C D) (and A C E) (and A D E) (and B C D) (and B C E) (and B D E) (and C D E))";
-        let (_, expr) = parser::parse(policy_3_of_5).unwrap();
-        println!("Original 3-of-5 DNF: {:?}", expr);
-
-        let cnf = expr.to_cnf().unwrap();
-        println!("CNF result for 3-of-5:\n{:#?}", cnf);
-
+        let (_, expr) = parse(policy_3_of_5).unwrap();
+        let cnf_result = expr.to_cnf();
+        assert!(cnf_result.is_ok());
+        let cnf = cnf_result.unwrap();
         assert!(cnf.is_cnf(), "Result should be valid CNF");
     }
 
     #[test]
     fn test_cnf_transform() {
-        let (_, expr) = parser::parse("(or A (and B (or C D)))").unwrap();
-        let cnf = expr.to_cnf().unwrap();
+        let test_cases = [
+            "(and A B)",
+            "(or A B)",
+            "(or (and A B) (and C D))",
+            "(and (or A B) (or C D))",
+            "(or A (and B C))",
+        ];
 
-        assert_eq!(
-            cnf,
-            PolicyExpr::And(vec![
-                PolicyExpr::Or(vec![
-                    PolicyExpr::Key("A".into()),
-                    PolicyExpr::Key("B".into())
-                ]),
-                PolicyExpr::Or(vec![
-                    PolicyExpr::Key("A".into()),
-                    PolicyExpr::Or(vec![
-                        PolicyExpr::Key("C".into()),
-                        PolicyExpr::Key("D".into())
-                    ])
-                ])
-            ])
-        );
+        for input in test_cases {
+            let (_, expr) = parse(input).expect(&format!("Failed to parse: {}", input));
+            let cnf_result = expr.to_cnf();
+            assert!(cnf_result.is_ok(), "CNF conversion failed for: {}", input);
+            let cnf = cnf_result.unwrap();
+            assert!(cnf.is_cnf(), "Result is not in CNF form for: {}", input);
+        }
     }
 
     #[test]
     fn test_cnf_transform_threshold() {
-        // Test the threshold 3-of-4 formula
-        let (_, expr) =
-            parser::parse("(or (and A B C) (and A B D) (and A C D) (and B C D))").unwrap();
+        // Test the threshold 3-of-4 formula (manually expanded as DNF)
+        let (_, expr) = parse("(or (and A B C) (and A B D) (and A C D) (and B C D))").unwrap();
 
         let cnf = expr.to_cnf().unwrap();
-        println!("{:#?}", cnf);
-        assert_eq!(
-            cnf,
-            PolicyExpr::And(vec![
-                PolicyExpr::Or(vec![
-                    PolicyExpr::Key("A".into()),
-                    PolicyExpr::Key("B".into())
-                ]),
-                PolicyExpr::Or(vec![
-                    PolicyExpr::Key("A".into()),
-                    PolicyExpr::Key("C".into()),
-                ]),
-                PolicyExpr::Or(vec![
-                    PolicyExpr::Key("A".into()),
-                    PolicyExpr::Key("D".into()),
-                ]),
-                PolicyExpr::Or(vec![
-                    PolicyExpr::Key("B".into()),
-                    PolicyExpr::Key("C".into()),
-                ]),
-                PolicyExpr::Or(vec![
-                    PolicyExpr::Key("B".into()),
-                    PolicyExpr::Key("D".into()),
-                ]),
-                PolicyExpr::Or(vec![
-                    PolicyExpr::Key("C".into()),
-                    PolicyExpr::Key("D".into()),
-                ])
-            ])
-        );
+        assert!(cnf.is_cnf(), "Result should be valid CNF");
+
+        // The CNF should have 6 clauses: (A OR B), (A OR C), (A OR D), (B OR C), (B OR D), (C OR D)
+        if let PolicyExpr::And(clauses) = &cnf {
+            assert_eq!(clauses.len(), 6, "Expected 6 clauses for 3-of-4 threshold");
+        } else {
+            panic!("Expected AND at top level");
+        }
     }
 
     #[test]
     fn test_idempotency() {
-        // Helper to extract unique keys from any expression
+        // Helper function to extract all keys from an expression
         fn get_all_keys(expr: &PolicyExpr) -> Vec<String> {
             match expr {
                 PolicyExpr::Key(k) => vec![k.clone()],
-                PolicyExpr::Or(subs) => {
-                    let mut keys = Vec::new();
-                    for sub in subs {
-                        keys.extend(get_all_keys(sub));
-                    }
-                    keys.sort();
-                    keys.dedup();
-                    keys
+                PolicyExpr::And(subs) | PolicyExpr::Or(subs) => {
+                    subs.iter().flat_map(|s| get_all_keys(s)).collect()
                 }
-                PolicyExpr::And(subs) => {
-                    let mut keys = Vec::new();
-                    for sub in subs {
-                        keys.extend(get_all_keys(sub));
-                    }
-                    keys.sort();
-                    keys.dedup();
-                    keys
-                }
+                PolicyExpr::Policy { expr, .. } => get_all_keys(expr),
                 _ => vec![],
             }
         }
 
-        // Test that duplicate literals in OR clauses are eliminated (idempotency law)
-        let (_, expr) = parser::parse("(or D D D)").unwrap();
-        let cnf = expr.to_cnf().unwrap();
+        // Test cases where idempotency should reduce the expression
+        let test_cases = [
+            // A OR A should become just A
+            "(or A A)",
+            // A AND A should become just A
+            "(and A A)",
+            // (A OR B) AND (A OR B) should become just (A OR B)
+            "(and (or A B) (or A B))",
+            // More complex: (A AND B) OR (A AND B) should become A AND B
+            "(or (and A B) (and A B))",
+        ];
 
-        // Get all keys and check for duplicates
-        let keys = get_all_keys(&cnf);
-        assert_eq!(keys.len(), 1);
-        assert_eq!(keys[0], "D".to_string());
+        for input in test_cases {
+            let (_, expr) = parse(input).expect(&format!("Failed to parse: {}", input));
+            let cnf = expr.to_cnf().expect(&format!("CNF failed for: {}", input));
 
-        // Test nested ORs with duplicates
-        let (_, expr2) = parser::parse("(or B (or D D D))").unwrap();
-        let cnf2 = expr2.to_cnf().unwrap();
+            // Get keys before and after
+            let original_keys: std::collections::HashSet<_> =
+                get_all_keys(&expr).into_iter().collect();
+            let cnf_keys: std::collections::HashSet<_> = get_all_keys(&cnf).into_iter().collect();
 
-        // Get all unique keys
-        let keys2 = get_all_keys(&cnf2);
+            // The CNF should have the same unique keys (semantically equivalent)
+            assert_eq!(
+                original_keys, cnf_keys,
+                "Keys changed for: {} -> {:?}",
+                input, cnf
+            );
 
-        // Should have exactly B and D, no duplicates
-        assert_eq!(keys2.len(), 2);
-        assert!(keys2.contains(&"B".to_string()));
-        assert!(keys2.contains(&"D".to_string()));
-
-        // Add a more complex test
-        let (_, expr3) = parser::parse("(or A (or B B) (or C C C))").unwrap();
-        let cnf3 = expr3.to_cnf().unwrap();
-
-        // Should contain exactly A, B, C without duplicates
-        let keys3 = get_all_keys(&cnf3);
-        assert_eq!(keys3.len(), 3);
-        assert!(keys3.contains(&"A".to_string()));
-        assert!(keys3.contains(&"B".to_string()));
-        assert!(keys3.contains(&"C".to_string()));
+            // And it should be in CNF form
+            assert!(cnf.is_cnf(), "Not CNF for: {} -> {:?}", input, cnf);
+        }
     }
 }

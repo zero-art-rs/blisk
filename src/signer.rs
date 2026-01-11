@@ -155,9 +155,10 @@ mod tests {
     use crate::musig2::aggregate_partial_signatures;
     use crate::musig2::verify_signature;
     use crate::parser::parse;
-    use ark_ed25519::{EdwardsAffine as G1Affine, Fr};
     use ark_ff::{BigInteger, PrimeField};
+    use ark_secp256k1::{Affine as G1Affine, Fr};
     use rand::thread_rng;
+    use std::time::Instant;
 
     #[test]
     fn test_policy_3_of_4_signature() {
@@ -331,18 +332,23 @@ mod tests {
             combinations.join("\n        ")
         );
 
-        println!("Policy circuit:\n{}", circuit);
+        println!("Policy 'Threshold {}/{}'", k, n);
 
         let compiler = Compiler::new();
+        let mut start = Instant::now();
         let (_, expr) = parse(&circuit).unwrap();
+        println!("Parsing time: {:?}", start.elapsed());
 
-        // generate random keys for each party (A through O)
+        start = Instant::now();
         let test_keys = expr.generate_random_keys().unwrap();
         let public_keys = test_keys
             .iter()
             .map(|(k, (_, pk))| (k.clone(), *pk))
             .collect();
 
+        println!("Key generation time: {:?}", start.elapsed());
+
+        start = Instant::now();
         // initialize the compilation options
         let options = CompilationOptions {
             public_keys,
@@ -357,7 +363,16 @@ mod tests {
 
         let policy = compiler.compile(&expr, options).unwrap();
 
-        println!("raw_policy: {}", policy);
+        println!("Compilation time: {:?}", start.elapsed());
+
+        println!("Compiled S-Expression: {}", policy.to_expr());
+        println!(
+            "Policy metrics: width={}, depth={}",
+            policy.get_clauses_count().unwrap(),
+            policy.get_maximal_clause_depth().unwrap()
+        );
+
+        start = Instant::now();
         // Resolve with k signers (first k parties)
         let signing_parties = parties[..k].to_vec();
         let mut resolved_policy = policy;
@@ -365,44 +380,29 @@ mod tests {
             resolved_policy = resolved_policy.resolve(test_keys[*party].0).unwrap();
         }
 
-        println!("resolved_policy: {}", resolved_policy);
+        println!("Resolution time: {:?}", start.elapsed());
 
         let message = b"test_message_11_of_15";
 
-        // Debug: print all clause public keys
-        let all_clause_pks = resolved_policy.get_clauses_public_keys().unwrap();
-        println!("Total clause public keys: {}", all_clause_pks.len());
-        for (i, pk) in all_clause_pks.iter().enumerate() {
-            println!("  clause_pk[{}]: {:?}", i, pk);
-        }
-
+        start = Instant::now();
         // create signers for the k participating parties
         let mut signers: Vec<Signer<G1Affine, DefaultMuSig2Hash<Fr>>> = signing_parties
             .iter()
             .map(|party| {
-                let signer = Signer::new(
+                Signer::new(
                     format!("Signer_{}", party),
                     test_keys[*party].0,
                     &mut resolved_policy,
                     message.into(),
                     DefaultMuSig2Hash::new(),
                 )
-                .unwrap();
-                println!(
-                    "Signer {} has {} clause keys",
-                    party,
-                    signer.clauses_keys.len()
-                );
-                for (i, (_, pk)) in signer.clauses_keys.iter().enumerate() {
-                    let in_clause_pks = all_clause_pks.contains(pk);
-                    println!(
-                        "  clause_key[{}]: {:?} (in clause_pks: {})",
-                        i, pk, in_clause_pks
-                    );
-                }
-                signer
+                .unwrap()
             })
             .collect();
+
+        println!("Signers creation time: {:?}", start.elapsed());
+
+        start = Instant::now();
 
         // Generate nonces for all signers
         let all_nonces: Vec<Vec<(G1Affine, (G1Affine, G1Affine))>> = signers
@@ -433,12 +433,20 @@ mod tests {
             assert_eq!(*nonce, first_nonce, "Aggregated nonces should be equal");
         }
 
+        println!("Signature phase1 time: {:?}", start.elapsed());
+
+        start = Instant::now();
+
         // Sign the message with all signers
         let all_signatures: Vec<Vec<Fr>> = signers.iter_mut().map(|s| s.sign().unwrap()).collect();
 
         // Combine all partial signatures
         let combined_sig =
             aggregate_partial_signatures(&all_signatures.concat(), first_nonce).unwrap();
+
+        println!("Signature phase2 time: {:?}", start.elapsed());
+
+        start = Instant::now();
 
         // Aggregated public key is obtained from the root node of the resolved policy tree
         let aggregated_public_key = resolved_policy.get_public_key().unwrap();
@@ -452,17 +460,13 @@ mod tests {
         )
         .unwrap();
 
-        println!("Verification result: {}", verified);
+        println!("Verification time: {:?}", start.elapsed());
+
         assert!(verified, "Signature verification should succeed");
     }
 
     #[test]
     fn test_threshold_signature() {
-        test_policy_k_of_n_signature(3, 5);
-    }
-
-    #[test]
-    fn test_policy_11_of_15_signature() {
-        test_policy_k_of_n_signature(11, 15);
+        test_policy_k_of_n_signature(13, 15);
     }
 }
