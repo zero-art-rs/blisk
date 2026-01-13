@@ -330,4 +330,58 @@ mod tests {
         let result = compiler.compile(&expr, options).unwrap();
         println!("{}", result);
     }
+
+    #[test]
+    fn test_compile_threshold_expression() {
+        // Test compiling a threshold expression directly
+        let compiler = Compiler::new();
+        let (_, expr) = parser::parse("(policy threshold_2_of_3 (threshold 2 A B C))").unwrap();
+        let keys = expr.generate_random_keys::<G1Affine>().unwrap();
+        let public_keys = keys.into_iter().map(|(k, (_, pk))| (k, pk)).collect();
+
+        let options = CompilationOptions {
+            public_keys,
+            iota,
+            aggregate,
+            transform_to_cnf: true,
+        };
+
+        let result = compiler.compile(&expr, options).unwrap();
+        println!("Compiled threshold 2-of-3: {}", result);
+
+        // The result should be a valid policy tree
+        // For 2-of-3, CNF should have C(3,2) = 3 clauses: (A∨B), (A∨C), (B∨C)
+        assert_eq!(
+            result.get_clauses_count().unwrap(),
+            3,
+            "2-of-3 threshold should have 3 clauses in CNF"
+        );
+    }
+
+    #[test]
+    fn test_compile_threshold_3_of_4() {
+        // Test compiling a 3-of-4 threshold expression
+        let compiler = Compiler::new();
+        let (_, expr) = parser::parse("(policy threshold_3_of_4 (threshold 3 A B C D))").unwrap();
+        let keys = expr.generate_random_keys::<G1Affine>().unwrap();
+        let public_keys = keys.into_iter().map(|(k, (_, pk))| (k, pk)).collect();
+
+        let options = CompilationOptions {
+            public_keys,
+            iota,
+            aggregate,
+            transform_to_cnf: true,
+        };
+
+        let result = compiler.compile(&expr, options).unwrap();
+        println!("Compiled threshold 3-of-4: {}", result);
+
+        // For 3-of-4, CNF should have C(4,2) = 6 clauses
+        // Each clause has m = 4 - 3 + 1 = 2 elements
+        assert_eq!(
+            result.get_clauses_count().unwrap(),
+            6,
+            "3-of-4 threshold should have 6 clauses in CNF"
+        );
+    }
 }

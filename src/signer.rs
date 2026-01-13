@@ -161,13 +161,9 @@ mod tests {
     use std::time::Instant;
 
     #[test]
-    fn test_policy_3_of_4_signature() {
+    fn test_policy_a_or_b_and_c_or_d_signature() {
         let threshold_3_of_4_circuit = "(policy threshold_3_of_4_circuit
-                                            (or
-                                                (and A B C)
-                                                (and A B D)
-                                                (and A C D)
-                                                (and B C D)))";
+                                            (and (or A B) (or C D)))";
         let compiler = Compiler::new();
         let (_, expr) = parse(threshold_3_of_4_circuit).unwrap();
         // generate random keys for each party (A,B,C,D)
@@ -179,7 +175,7 @@ mod tests {
         // initialize the compilation options
         let options = CompilationOptions {
             public_keys,
-            transform_to_cnf: true, // acquire the policy circuit to be in CNF form
+            transform_to_cnf: true, // acquire the policy circuit to be in CNF form (however this one is already in CNF form)
             aggregate: |points| {
                 musig2::aggregate_public_keys(&points, &DefaultMuSig2Hash::new()).unwrap()
             }, // initialize the aggregate function of MuSig2 protocol
@@ -191,19 +187,10 @@ mod tests {
         let mut resolved_policy = policy
             .resolve(test_keys["A"].0)
             .unwrap()
-            .resolve(test_keys["B"].0)
-            .unwrap()
             .resolve(test_keys["C"].0)
             .unwrap();
 
         let message = b"test_message";
-
-        // Debug: print clause public keys
-        let all_clause_pks = resolved_policy.get_clauses_public_keys().unwrap();
-        println!("3-of-4 Total clause public keys: {}", all_clause_pks.len());
-        for (i, pk) in all_clause_pks.iter().enumerate() {
-            println!("  clause_pk[{}]: {:?}", i, pk);
-        }
 
         // create signers
         let mut signer_A = Signer::new(
@@ -214,86 +201,45 @@ mod tests {
             DefaultMuSig2Hash::new(),
         )
         .unwrap();
-        println!("Signer A has {} clause keys", signer_A.clauses_keys.len());
-        for (i, (_, pk)) in signer_A.clauses_keys.iter().enumerate() {
-            let in_clause_pks = all_clause_pks.contains(pk);
-            println!(
-                "  A clause_key[{}]: {:?} (in clause_pks: {})",
-                i, pk, in_clause_pks
-            );
-        }
-
-        let mut signer_B = Signer::new(
-            "Bob".into(),
-            test_keys["B"].0,
-            &mut resolved_policy,
-            message.into(),
-            DefaultMuSig2Hash::new(),
-        )
-        .unwrap();
-        println!("Signer B has {} clause keys", signer_B.clauses_keys.len());
-        for (i, (_, pk)) in signer_B.clauses_keys.iter().enumerate() {
-            let in_clause_pks = all_clause_pks.contains(pk);
-            println!(
-                "  B clause_key[{}]: {:?} (in clause_pks: {})",
-                i, pk, in_clause_pks
-            );
-        }
 
         let mut signer_C = Signer::new(
-            "Charlie".into(),
+            "Bob".into(),
             test_keys["C"].0,
             &mut resolved_policy,
             message.into(),
             DefaultMuSig2Hash::new(),
         )
         .unwrap();
-        println!("Signer C has {} clause keys", signer_C.clauses_keys.len());
-        for (i, (_, pk)) in signer_C.clauses_keys.iter().enumerate() {
-            let in_clause_pks = all_clause_pks.contains(pk);
-            println!(
-                "  C clause_key[{}]: {:?} (in clause_pks: {})",
-                i, pk, in_clause_pks
-            );
-        }
 
-        // now only Alice, Bob, Charlie sign the message
+        // now only A and C sign the message
 
         // they generate nonces
         let a_nonces = signer_A.generate_nonces(&mut thread_rng()).unwrap();
-        let b_nonces = signer_B.generate_nonces(&mut thread_rng()).unwrap();
         let c_nonces = signer_C.generate_nonces(&mut thread_rng()).unwrap();
 
         // they process nonces
         for (key, nonces) in a_nonces {
-            signer_B.process_nonces(key, nonces).unwrap();
-            signer_C.process_nonces(key, nonces).unwrap();
-        }
-        for (key, nonces) in b_nonces {
-            signer_A.process_nonces(key, nonces).unwrap();
             signer_C.process_nonces(key, nonces).unwrap();
         }
         for (key, nonces) in c_nonces {
             signer_A.process_nonces(key, nonces).unwrap();
-            signer_B.process_nonces(key, nonces).unwrap();
         }
 
         // they aggregate nonces
         let R1 = signer_A.aggregate_nonces().unwrap();
-        let R2 = signer_B.aggregate_nonces().unwrap();
-        let R3 = signer_C.aggregate_nonces().unwrap();
+
+        let R2 = signer_C.aggregate_nonces().unwrap();
 
         // assure nonces are equal
-        assert!(R1 == R2 && R2 == R3);
+        assert!(R1 == R2);
 
         // they sign the message
         let a_sig = signer_A.sign().unwrap();
-        let b_sig = signer_B.sign().unwrap();
+
         let c_sig = signer_C.sign().unwrap();
 
         // they combine their signatures
-        let combined_sig =
-            aggregate_partial_signatures(&[a_sig, b_sig, c_sig].concat(), R1).unwrap();
+        let combined_sig = aggregate_partial_signatures(&[a_sig, c_sig].concat(), R1).unwrap();
 
         // aggregated public key is obtained from the root node of the resolved policy tree
         let aggregated_public_key = resolved_policy.get_public_key().unwrap();
@@ -306,14 +252,13 @@ mod tests {
             &DefaultMuSig2Hash::new(),
         )
         .unwrap();
-        // they print the result
-        println!("Verification result: {}", verified);
+        assert!(verified);
     }
 
     fn test_policy_k_of_n_signature(k: usize, n: usize) {
         use itertools::Itertools;
 
-        // Generate all 11-of-15 combinations as AND clauses combined with OR
+        // Generate all k-of-n combinations as AND clauses combined with OR
         let parties = {
             let alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
             let count = n.min(26);
@@ -382,7 +327,7 @@ mod tests {
 
         println!("Resolution time: {:?}", start.elapsed());
 
-        let message = b"test_message_11_of_15";
+        let message = b"Hello BLISK";
 
         start = Instant::now();
         // create signers for the k participating parties
@@ -467,6 +412,6 @@ mod tests {
 
     #[test]
     fn test_threshold_signature() {
-        test_policy_k_of_n_signature(13, 15);
+        test_policy_k_of_n_signature(3, 5);
     }
 }

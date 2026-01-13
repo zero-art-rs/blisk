@@ -1,5 +1,6 @@
 use crate::errors::PolicyError;
 use crate::parser::PolicyExpr;
+use itertools::Itertools;
 use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::result::Result;
@@ -176,7 +177,130 @@ impl PolicyExpr {
             return Ok(self.clone());
         }
 
+        // Handle Threshold separately - convert directly to CNF
+        if let PolicyExpr::Threshold { k, subs } = self {
+            return Self::threshold_to_cnf(*k, subs);
+        }
+
+        // Handle Policy wrapper with Threshold inside
+        if let PolicyExpr::Policy { name, expr } = self {
+            if let PolicyExpr::Threshold { k, subs } = expr.as_ref() {
+                let inner_cnf = Self::threshold_to_cnf(*k, subs)?;
+                return Ok(PolicyExpr::Policy {
+                    name: name.clone(),
+                    expr: Box::new(inner_cnf),
+                });
+            }
+        }
+
         self.to_nnf()?.distribute()?.ensure_binary_or()
+    }
+
+    /// Converts a k-of-n threshold expression directly to CNF form.
+    ///
+    /// Based on the theorem: For a k-of-n threshold function f (the disjunction of all
+    /// conjunctions of size k), the CNF is the conjunction of all disjunctions of size m = n - k + 1.
+    ///
+    /// For example, a 3-of-4 threshold {A, B, C, D}:
+    /// - DNF: (A∧B∧C) ∨ (A∧B∧D) ∨ (A∧C∧D) ∨ (B∧C∧D)
+    /// - CNF: (A∨B) ∧ (A∨C) ∧ (A∨D) ∧ (B∨C) ∧ (B∨D) ∧ (C∨D)
+    ///   where each clause has size m = 4 - 3 + 1 = 2
+    fn threshold_to_cnf(k: u32, subs: &[PolicyExpr]) -> Result<PolicyExpr, PolicyError> {
+        let n = subs.len();
+        let k = k as usize;
+
+        // Validate inputs
+        if k == 0 {
+            return Err(PolicyError::CompilationError(
+                "Threshold k must be at least 1".to_string(),
+            ));
+        }
+        if k > n {
+            return Err(PolicyError::CompilationError(format!(
+                "Threshold k={} cannot be greater than number of subs n={}",
+                k, n
+            )));
+        }
+
+        // First, recursively convert all sub-expressions to CNF
+        let cnf_subs: Vec<PolicyExpr> = subs
+            .iter()
+            .map(|sub| sub.to_cnf())
+            .collect::<Result<Vec<_>, _>>()?;
+
+        // Check if all subs are simple keys (literals)
+        let all_simple_keys = cnf_subs.iter().all(|s| matches!(s, PolicyExpr::Key(_)));
+
+        // Special case: k == n means all must sign (AND of all subs)
+        if k == n {
+            let and_expr = PolicyExpr::And(cnf_subs);
+            return and_expr.distribute()?.ensure_binary_or();
+        }
+
+        // Special case: k == 1 means any can sign (OR of all subs)
+        if k == 1 {
+            // Build the OR and then convert to CNF (handles nested structures)
+            let or_expr = PolicyExpr::Or(cnf_subs);
+            return or_expr.distribute()?.ensure_binary_or();
+        }
+
+        // If all subs are simple keys, we can apply the theorem directly
+        if all_simple_keys {
+            // General case: Apply the CNF theorem
+            // m = n - k + 1 is the size of each OR clause in the CNF
+            let m = n - k + 1;
+
+            // Generate all combinations of size m from the CNF-converted subs
+            // Each combination becomes an OR clause in the final CNF
+            let or_clauses: Vec<PolicyExpr> = cnf_subs
+                .iter()
+                .combinations(m)
+                .map(|combo| {
+                    // Each combination of m elements becomes an OR clause
+                    let literals: Vec<PolicyExpr> = combo.into_iter().cloned().collect();
+                    if literals.len() == 1 {
+                        literals.into_iter().next().unwrap()
+                    } else {
+                        PolicyExpr::Or(literals)
+                    }
+                })
+                .collect();
+
+            // The final CNF is an AND of all these OR clauses
+            let result = if or_clauses.len() == 1 {
+                or_clauses.into_iter().next().unwrap()
+            } else {
+                PolicyExpr::And(or_clauses)
+            };
+
+            // Apply ensure_binary_or to get proper binary tree structure
+            return result.ensure_binary_or();
+        }
+
+        // For complex subs (containing AND/OR), we need to expand to DNF first,
+        // then convert to CNF using standard distribution.
+        // DNF of k-of-n threshold: OR of all AND combinations of size k
+        let dnf_conjunctions: Vec<PolicyExpr> = cnf_subs
+            .iter()
+            .combinations(k)
+            .map(|combo| {
+                let conjuncts: Vec<PolicyExpr> = combo.into_iter().cloned().collect();
+                if conjuncts.len() == 1 {
+                    conjuncts.into_iter().next().unwrap()
+                } else {
+                    PolicyExpr::And(conjuncts)
+                }
+            })
+            .collect();
+
+        let dnf = if dnf_conjunctions.len() == 1 {
+            dnf_conjunctions.into_iter().next().unwrap()
+        } else {
+            PolicyExpr::Or(dnf_conjunctions)
+        };
+
+        // Now convert DNF to CNF using standard distribution
+        dnf.distribute()?.ensure_binary_or()
     }
 
     /// Converts the expression to Negation Normal Form (NNF).
@@ -208,9 +332,10 @@ impl PolicyExpr {
             PolicyExpr::Not(_) => Err(PolicyError::CompilationError(
                 "CNF conversion does not support NOT operations.".to_string(),
             )),
-            PolicyExpr::Threshold { .. } => Err(PolicyError::CompilationError(
-                "CNF conversion does not support Threshold operations.".to_string(),
-            )),
+            PolicyExpr::Threshold { k, subs } => {
+                // Convert threshold to CNF first, then to NNF
+                Self::threshold_to_cnf(*k, subs)?.to_nnf()
+            }
             PolicyExpr::WeightedThreshold { .. } => Err(PolicyError::CompilationError(
                 "CNF conversion does not support WeightedThreshold operations.".to_string(),
             )),
@@ -737,5 +862,152 @@ mod tests {
             // And it should be in CNF form
             assert!(cnf.is_cnf(), "Not CNF for: {} -> {:?}", input, cnf);
         }
+    }
+
+    #[test]
+    fn test_threshold_to_cnf_2_of_3() {
+        // 2-of-3 threshold: (threshold 2 A B C)
+        // DNF equivalent: (or (and A B) (and A C) (and B C))
+        // CNF should be: (A or B) and (A or C) and (B or C) -- each clause has m = 3 - 2 + 1 = 2 elements
+        let (_, expr) = parse("(threshold 2 A B C)").unwrap();
+        let cnf = expr.to_cnf().unwrap();
+
+        assert!(cnf.is_cnf(), "Result should be valid CNF: {:?}", cnf);
+
+        // Should have C(3,2) = 3 clauses
+        if let PolicyExpr::And(clauses) = &cnf {
+            assert_eq!(clauses.len(), 3, "Expected 3 clauses for 2-of-3 threshold");
+        } else {
+            panic!("Expected AND at top level, got: {:?}", cnf);
+        }
+    }
+
+    #[test]
+    fn test_threshold_to_cnf_3_of_4() {
+        // 3-of-4 threshold: (threshold 3 A B C D)
+        // CNF should have C(4,2) = 6 clauses, each with m = 4 - 3 + 1 = 2 elements
+        let (_, expr) = parse("(threshold 3 A B C D)").unwrap();
+        let cnf = expr.to_cnf().unwrap();
+
+        assert!(cnf.is_cnf(), "Result should be valid CNF: {:?}", cnf);
+
+        if let PolicyExpr::And(clauses) = &cnf {
+            assert_eq!(clauses.len(), 6, "Expected 6 clauses for 3-of-4 threshold");
+        } else {
+            panic!("Expected AND at top level, got: {:?}", cnf);
+        }
+    }
+
+    #[test]
+    fn test_threshold_to_cnf_2_of_4() {
+        // 2-of-4 threshold: (threshold 2 A B C D)
+        // CNF should have C(4,3) = 4 clauses, each with m = 4 - 2 + 1 = 3 elements
+        let (_, expr) = parse("(threshold 2 A B C D)").unwrap();
+        let cnf = expr.to_cnf().unwrap();
+
+        assert!(cnf.is_cnf(), "Result should be valid CNF: {:?}", cnf);
+
+        if let PolicyExpr::And(clauses) = &cnf {
+            assert_eq!(clauses.len(), 4, "Expected 4 clauses for 2-of-4 threshold");
+        } else {
+            panic!("Expected AND at top level, got: {:?}", cnf);
+        }
+    }
+
+    #[test]
+    fn test_threshold_to_cnf_special_cases() {
+        // k = n (all must sign) -> should become AND
+        let (_, expr) = parse("(threshold 3 A B C)").unwrap();
+        let cnf = expr.to_cnf().unwrap();
+        assert!(cnf.is_cnf(), "k=n case should be valid CNF");
+
+        // k = 1 (any can sign) -> should become OR
+        let (_, expr) = parse("(threshold 1 A B C)").unwrap();
+        let cnf = expr.to_cnf().unwrap();
+        assert!(cnf.is_cnf(), "k=1 case should be valid CNF");
+    }
+
+    #[test]
+    fn test_threshold_to_cnf_with_policy_wrapper() {
+        // Test threshold inside a policy wrapper
+        let (_, expr) = parse("(policy my_threshold (threshold 2 A B C))").unwrap();
+        let cnf = expr.to_cnf().unwrap();
+
+        assert!(cnf.is_cnf(), "Result should be valid CNF: {:?}", cnf);
+
+        // Should preserve the policy wrapper
+        if let PolicyExpr::Policy { name, expr: inner } = &cnf {
+            assert_eq!(name, "my_threshold");
+            assert!(inner.is_cnf(), "Inner expression should be CNF");
+        } else {
+            panic!("Expected Policy wrapper, got: {:?}", cnf);
+        }
+    }
+
+    #[test]
+    fn test_threshold_equivalence_to_manual_dnf() {
+        // Verify that (threshold 3 A B C D) produces same CNF as manual DNF expansion
+        let (_, threshold_expr) = parse("(threshold 3 A B C D)").unwrap();
+        let (_, dnf_expr) =
+            parse("(or (and A B C) (and A B D) (and A C D) (and B C D))").unwrap();
+
+        let threshold_cnf = threshold_expr.to_cnf().unwrap();
+        let dnf_cnf = dnf_expr.to_cnf().unwrap();
+
+        // Both should produce CNF with 6 clauses
+        if let (PolicyExpr::And(t_clauses), PolicyExpr::And(d_clauses)) =
+            (&threshold_cnf, &dnf_cnf)
+        {
+            assert_eq!(
+                t_clauses.len(),
+                d_clauses.len(),
+                "Threshold and DNF should produce same number of clauses"
+            );
+        } else {
+            panic!(
+                "Both should be AND expressions: threshold={:?}, dnf={:?}",
+                threshold_cnf, dnf_cnf
+            );
+        }
+    }
+
+    #[test]
+    fn test_threshold_invalid_k() {
+        // k > n should fail
+        let expr = PolicyExpr::Threshold {
+            k: 5,
+            subs: vec![
+                PolicyExpr::Key("A".to_string()),
+                PolicyExpr::Key("B".to_string()),
+                PolicyExpr::Key("C".to_string()),
+            ],
+        };
+        assert!(expr.to_cnf().is_err(), "k > n should fail");
+
+        // k = 0 should fail
+        let expr = PolicyExpr::Threshold {
+            k: 0,
+            subs: vec![
+                PolicyExpr::Key("A".to_string()),
+                PolicyExpr::Key("B".to_string()),
+            ],
+        };
+        assert!(expr.to_cnf().is_err(), "k = 0 should fail");
+    }
+
+    #[test]
+    fn test_threshold_with_nested_expressions() {
+        // Threshold with nested AND/OR expressions as subs
+        // For (threshold 2 X Y Z) where X=(and A B), Y=(or C D), Z=E
+        // This is a 2-of-3 threshold, so we need at least 2 of the 3 subs to be satisfied
+        let (_, expr) = parse("(threshold 2 (and A B) (or C D) E)").unwrap();
+        let cnf = expr.to_cnf().unwrap();
+
+        assert!(cnf.is_cnf(), "Nested threshold should produce valid CNF: {:?}", cnf);
+
+        // Also test simpler nested case
+        let (_, expr2) = parse("(threshold 2 (and A B) C D)").unwrap();
+        let cnf2 = expr2.to_cnf().unwrap();
+        assert!(cnf2.is_cnf(), "Simpler nested threshold should produce valid CNF: {:?}", cnf2);
     }
 }
