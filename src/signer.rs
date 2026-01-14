@@ -255,7 +255,7 @@ mod tests {
         assert!(verified);
     }
 
-    fn test_policy_k_of_n_signature(k: usize, n: usize) {
+    fn test_policy_k_of_n_signature(use_threshold_keyword: bool, k: usize, n: usize) {
         use itertools::Itertools;
 
         // Generate all k-of-n combinations as AND clauses combined with OR
@@ -266,16 +266,27 @@ mod tests {
                 .map(|i| &alphabet[i..i + 1])
                 .collect::<Vec<&str>>()
         };
-        let combinations: Vec<String> = parties
-            .iter()
-            .combinations(k)
-            .map(|combo| format!("(and {})", combo.iter().join(" ")))
-            .collect();
 
-        let circuit = format!(
-            "(policy threshold_{k}_of_{n}_circuit\n    (or\n        {}))",
-            combinations.join("\n        ")
-        );
+        let circuit = match use_threshold_keyword {
+            false => {
+                let combinations: Vec<String> = parties
+                    .iter()
+                    .combinations(k)
+                    .map(|combo| format!("(and {})", combo.iter().join(" ")))
+                    .collect();
+
+                format!(
+                    "(policy threshold_{k}_of_{n}_circuit\n    (or\n        {}))",
+                    combinations.join("\n        ")
+                )
+            }
+            true => {
+                format!(
+                    "(policy threshold_{k}_of_{n}_circuit (threshold {k} {}))",
+                    parties.iter().join(" ")
+                )
+            }
+        };
 
         println!("Policy 'Threshold {}/{}'", k, n);
 
@@ -355,6 +366,10 @@ mod tests {
             .map(|s| s.generate_nonces(&mut thread_rng()).unwrap())
             .collect();
 
+        println!("Generate nonces time {:?}", start.elapsed());
+
+        start = Instant::now();
+
         // Process nonces: each signer receives nonces from all other signers
         for i in 0..signers.len() {
             for j in 0..signers.len() {
@@ -365,6 +380,10 @@ mod tests {
                 }
             }
         }
+
+        println!("Process nonces time {:?}", start.elapsed());
+
+        start = Instant::now();
 
         // Aggregate nonces for all signers and verify they match
         let aggregated_nonces: Vec<G1Affine> = signers
@@ -378,7 +397,7 @@ mod tests {
             assert_eq!(*nonce, first_nonce, "Aggregated nonces should be equal");
         }
 
-        println!("Signature phase1 time: {:?}", start.elapsed());
+        println!("Aggregate nonces time: {:?}", start.elapsed());
 
         start = Instant::now();
 
@@ -412,6 +431,6 @@ mod tests {
 
     #[test]
     fn test_threshold_signature() {
-        test_policy_k_of_n_signature(3, 5);
+        test_policy_k_of_n_signature(true, 12, 15);
     }
 }
