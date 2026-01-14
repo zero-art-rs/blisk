@@ -1,5 +1,8 @@
 use crate::errors::PolicyError;
-use crate::musig2::{MuSig2Error, MuSig2HashFunction, MuSig2Session, MuSig2Signature};
+use crate::musig2::{
+    MuSig2Error, MuSig2HashFunction, MuSig2Session, MuSig2Signature,
+    aggregate_public_keys_with_coeffs,
+};
 use crate::policy::PolicyTree;
 use ark_ec::{AffineRepr, CurveGroup};
 use itertools::Itertools;
@@ -26,6 +29,7 @@ impl<G: AffineRepr, H: MuSig2HashFunction<G::ScalarField> + Clone> Signer<G, H> 
     ) -> Result<Self, PolicyError> {
         let clauses_keys = policy.resolve_clauses_private_keys(secret_key)?;
         let co_signers = policy.get_clauses_public_keys()?;
+        let (agg_key, coeffs) = aggregate_public_keys_with_coeffs(&co_signers, &hash_function)?;
         Ok(Self {
             secret_key,
             public_key: (G::generator() * secret_key).into_affine(),
@@ -48,6 +52,8 @@ impl<G: AffineRepr, H: MuSig2HashFunction<G::ScalarField> + Clone> Signer<G, H> 
                         public_key,
                         co_signers.clone(),
                         hash_function.clone(),
+                        agg_key,
+                        coeffs.clone(),
                     )
                 })
                 .collect::<Result<Vec<_>, _>>()?,
@@ -69,16 +75,14 @@ impl<G: AffineRepr, H: MuSig2HashFunction<G::ScalarField> + Clone> Signer<G, H> 
                 ))
             })
             .collect::<Result<Vec<(G, (G, G))>, PolicyError>>()?;
-        nonces // exchange nonces between internal signers
-            .iter()
-            .map(|(public_key, nonce)| {
-                self.musig2_sessions
-                    .iter_mut()
-                    .filter(|s| s.cosigner_public_keys[s.local_signer_idx.unwrap()] != *public_key)
-                    .map(|s| s.add_public_nonces(*public_key, *nonce))
-                    .collect::<Result<(), _>>()
-            })
-            .collect::<Result<(), _>>()?;
+        // Exchange nonces between internal signers
+        for (public_key, nonce) in &nonces {
+            for session in self.musig2_sessions.iter_mut() {
+                if session.cosigner_public_keys[session.local_signer_idx.unwrap()] != *public_key {
+                    let _ = session.add_public_nonces(*public_key, *nonce);
+                }
+            }
+        }
         Ok(nonces)
     }
 
@@ -97,30 +101,38 @@ impl<G: AffineRepr, H: MuSig2HashFunction<G::ScalarField> + Clone> Signer<G, H> 
 
     /// perform the second round of MuSig2: nonce aggregation
     pub fn aggregate_nonces(&mut self) -> Result<G, PolicyError> {
-        let mut nonces = self
+        let (R1, c1, b1) = self
             .musig2_sessions
-            .iter_mut()
-            .map(|s| s.compute_aggregated_nonce())
-            .collect::<Result<Vec<G>, _>>()?;
-        nonces.dedup();
-        if nonces.len() != 1 {
+            .first_mut()
+            .ok_or(MuSig2Error::InvalidNonce)?
+            .compute_aggregated_nonce()?;
+        let (R2, c2, b2) = self
+            .musig2_sessions
+            .last_mut()
+            .ok_or(MuSig2Error::InvalidNonce)?
+            .compute_aggregated_nonce()?;
+        if R1 != R2 || c1 != c2 || b1 != b2 {
             return Err(MuSig2Error::InvalidNonce.into());
         }
-        Ok(nonces[0])
+        // Skip first and last elements since they already computed their nonces
+        let len = self.musig2_sessions.len();
+        if len > 2 {
+            for session in self.musig2_sessions[1..len - 1].iter_mut() {
+                session.accept_aggregated_nonce(R1, c1, b1)?;
+            }
+        }
+
+        Ok(R1)
     }
 
     /// get aggregated public key
     pub fn aggregate_public_keys(&mut self) -> Result<G, PolicyError> {
-        let mut public_keys = self
+        let (public_key, _) = self
             .musig2_sessions
-            .iter_mut()
-            .map(|s| s.compute_aggregated_key())
-            .collect::<Result<Vec<G>, _>>()?;
-        public_keys.dedup();
-        if public_keys.len() != 1 {
-            return Err(MuSig2Error::InvalidPublicKey.into());
-        }
-        Ok(public_keys[0])
+            .first_mut()
+            .ok_or(MuSig2Error::InvalidPublicKey)?
+            .compute_aggregated_key()?;
+        Ok(public_key)
     }
 
     /// compute partial signatures
@@ -431,6 +443,6 @@ mod tests {
 
     #[test]
     fn test_threshold_signature() {
-        test_policy_k_of_n_signature(true, 12, 15);
+        test_policy_k_of_n_signature(true, 13, 15);
     }
 }

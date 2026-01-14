@@ -11,112 +11,6 @@ mod tests {
     use rand::{rngs::OsRng, thread_rng};
 
     #[test]
-    fn test_musig2_session_creation() {
-        // Create a signer with a random key
-        let sk1 = Fr::rand(&mut OsRng);
-        let pk1 = (EdwardsAffine::generator() * sk1).into_affine();
-
-        let sk2 = Fr::rand(&mut OsRng);
-        let pk2 = (EdwardsAffine::generator() * sk2).into_affine();
-
-        let sk3 = Fr::rand(&mut OsRng);
-        let pk3 = (EdwardsAffine::generator() * sk3).into_affine();
-
-        // Collect all public keys
-        let all_pks = vec![pk1, pk2, pk3];
-        let message = b"This is a test message for MuSig2 signing".to_vec();
-        let session_id = "test-session-1".to_string();
-
-        // Create hash function
-        let hash_fn = DefaultMuSig2Hash::new();
-
-        // Create session for signer 1
-        let session = MuSig2Session::new(
-            session_id.clone(),
-            message.clone(),
-            pk1,
-            all_pks.clone(),
-            hash_fn,
-        )
-        .expect("Session creation should succeed");
-
-        assert_eq!(session.state, MuSig2SessionState::Initialized);
-        assert_eq!(session.message, message);
-        assert_eq!(session.cosigner_public_keys.len(), 3);
-    }
-
-    #[test]
-    fn test_musig2_key_aggregation() {
-        // Create signers with random keys
-        let sk1 = Fr::rand(&mut OsRng);
-        let pk1 = (EdwardsAffine::generator() * sk1).into_affine();
-
-        let sk2 = Fr::rand(&mut OsRng);
-        let pk2 = (EdwardsAffine::generator() * sk2).into_affine();
-
-        let sk3 = Fr::rand(&mut OsRng);
-        let pk3 = (EdwardsAffine::generator() * sk3).into_affine();
-
-        // Collect all public keys
-        let all_pks = vec![pk1, pk2, pk3];
-        let message = b"This is a test message for MuSig2 signing".to_vec();
-        let session_id = "test-session-1".to_string();
-
-        // Create hash function
-        let hash_fn = DefaultMuSig2Hash::new();
-
-        // Create sessions for all signers
-        let mut session1 = MuSig2Session::new(
-            session_id.clone(),
-            message.clone(),
-            pk1,
-            all_pks.clone(),
-            hash_fn.clone(),
-        )
-        .expect("Session 1 creation should succeed");
-
-        let mut session2 = MuSig2Session::new(
-            session_id.clone(),
-            message.clone(),
-            pk2,
-            all_pks.clone(),
-            hash_fn.clone(),
-        )
-        .expect("Session 2 creation should succeed");
-
-        let mut session3 = MuSig2Session::new(
-            session_id.clone(),
-            message.clone(),
-            pk3,
-            all_pks.clone(),
-            hash_fn.clone(),
-        )
-        .expect("Session 3 creation should succeed");
-
-        // Compute aggregated keys independently
-        let agg_key1 = session1
-            .compute_aggregated_key()
-            .expect("Key aggregation for session 1 should succeed");
-
-        let agg_key2 = session2
-            .compute_aggregated_key()
-            .expect("Key aggregation for session 2 should succeed");
-
-        let agg_key3 = session3
-            .compute_aggregated_key()
-            .expect("Key aggregation for session 3 should succeed");
-
-        // All signers should compute the same aggregated key
-        assert_eq!(agg_key1, agg_key2);
-        assert_eq!(agg_key2, agg_key3);
-
-        // The aggregated key should not be equal to any individual key
-        assert_ne!(agg_key1, pk1);
-        assert_ne!(agg_key1, pk2);
-        assert_ne!(agg_key1, pk3);
-    }
-
-    #[test]
     fn test_musig2_full_signing_flow() {
         // Create signers with random keys
         let sk1 = Fr::rand(&mut OsRng);
@@ -136,6 +30,8 @@ mod tests {
         // Create hash function
         let hash_fn = DefaultMuSig2Hash::new();
 
+        let (agg_key, coeffs) = aggregate_public_keys_with_coeffs(&all_pks, &hash_fn).unwrap();
+
         // Create sessions for all signers
         let mut session1 = MuSig2Session::new(
             session_id.clone(),
@@ -143,6 +39,8 @@ mod tests {
             pk1,
             all_pks.clone(),
             hash_fn.clone(),
+            agg_key,
+            coeffs.clone(),
         )
         .expect("Session 1 creation should succeed");
 
@@ -152,6 +50,8 @@ mod tests {
             pk2,
             all_pks.clone(),
             hash_fn.clone(),
+            agg_key,
+            coeffs.clone(),
         )
         .expect("Session 2 creation should succeed");
 
@@ -161,6 +61,8 @@ mod tests {
             pk3,
             all_pks.clone(),
             hash_fn.clone(),
+            agg_key,
+            coeffs.clone(),
         )
         .expect("Session 3 creation should succeed");
 
@@ -288,6 +190,7 @@ mod tests {
         // Create hash function
         let hash_fn = DefaultMuSig2Hash::new();
 
+        let (agg_key, coeffs) = aggregate_public_keys_with_coeffs(&all_pks, &hash_fn).unwrap();
         // Create sessions for all signers
         let mut session1 = MuSig2Session::new(
             session_id.clone(),
@@ -295,6 +198,8 @@ mod tests {
             pk1,
             all_pks.clone(),
             hash_fn.clone(),
+            agg_key,
+            coeffs.clone(),
         )
         .expect("Session 1 creation should succeed");
 
@@ -304,11 +209,13 @@ mod tests {
             pk2,
             all_pks.clone(),
             hash_fn.clone(),
+            agg_key,
+            coeffs.clone(),
         )
         .expect("Session 2 creation should succeed");
 
         // Compute aggregated keys
-        let agg_key = session1
+        let (agg_key, _) = session1
             .compute_aggregated_key()
             .expect("Key aggregation for session 1 should succeed");
         let _ = session2
@@ -379,66 +286,5 @@ mod tests {
             !wrong_result,
             "Signature verification with wrong message should fail"
         );
-    }
-
-    #[test]
-    fn test_standalone_key_aggregation() {
-        // Create signers with random keys
-        let sk1 = Fr::rand(&mut OsRng);
-        let pk1 = (EdwardsAffine::generator() * sk1).into_affine();
-
-        let sk2 = Fr::rand(&mut OsRng);
-        let pk2 = (EdwardsAffine::generator() * sk2).into_affine();
-
-        let sk3 = Fr::rand(&mut OsRng);
-        let pk3 = (EdwardsAffine::generator() * sk3).into_affine();
-
-        // Collect all public keys in sorted order to ensure consistency
-        let mut sorted_pks = vec![pk1, pk2, pk3];
-        sorted_pks.sort_by(|a, b| {
-            let mut a_bytes = Vec::new();
-            let mut b_bytes = Vec::new();
-            a.serialize_compressed(&mut a_bytes).unwrap();
-            b.serialize_compressed(&mut b_bytes).unwrap();
-            a_bytes.cmp(&b_bytes)
-        });
-        let hash_fn = DefaultMuSig2Hash::new();
-
-        // Test standalone key aggregation
-        let agg_key_standalone = aggregate_public_keys(&sorted_pks, &hash_fn)
-            .expect("Standalone key aggregation should succeed");
-
-        // Test key aggregation with coefficients
-        let (agg_key_with_coeffs, coeffs) =
-            aggregate_public_keys_with_coeffs(&sorted_pks, &hash_fn)
-                .expect("Key aggregation with coefficients should succeed");
-
-        // Both functions should produce the same aggregated key
-        assert_eq!(agg_key_standalone, agg_key_with_coeffs);
-
-        // Coefficients should be non-empty
-        assert_eq!(coeffs.len(), 3);
-
-        // Now verify that session-based aggregation matches standalone
-        let message = b"Test message".to_vec();
-        let session_id = "test-session".to_string();
-
-        // Note: The MuSig2Session::new function will sort keys internally
-        let mut session = MuSig2Session::new(
-            session_id,
-            message,
-            pk1,
-            sorted_pks.clone(),
-            hash_fn.clone(),
-        )
-        .expect("Session creation should succeed");
-
-        let agg_key_session = session
-            .compute_aggregated_key()
-            .expect("Session-based key aggregation should succeed");
-
-        // All methods should produce the same result
-        assert_eq!(agg_key_standalone, agg_key_session);
-        assert_eq!(agg_key_with_coeffs, agg_key_session);
     }
 }

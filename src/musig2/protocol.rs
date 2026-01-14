@@ -9,6 +9,7 @@ use ark_serialize::CanonicalSerialize;
 use rand::RngCore;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::hash::RandomState;
 use std::marker::PhantomData;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -207,6 +208,8 @@ where
         local_public_key: G,
         cosigner_public_keys: Vec<G>,
         hash_function: H,
+        aggregated_public_key: G,
+        key_aggregation_coeffs: HashMap<SignerId, <G as AffineRepr>::ScalarField, RandomState>,
     ) -> Result<MuSig2Session<G, H>, MuSig2Error>
     where
         G: AffineRepr,
@@ -246,8 +249,8 @@ where
             state: MuSig2SessionState::Initialized,
             message,
             cosigner_public_keys: sorted_keys,
-            key_aggregation_coeffs: HashMap::new(),
-            aggregated_public_key: None,
+            key_aggregation_coeffs,
+            aggregated_public_key: Some(aggregated_public_key),
             local_signer_idx: local_idx,
             secret_nonces: None,
             public_nonces: HashMap::new(),
@@ -261,10 +264,21 @@ where
     }
 
     /// Compute the aggregated public key for the session
-    pub fn compute_aggregated_key(&mut self) -> Result<G, MuSig2Error> {
+    pub fn compute_aggregated_key(
+        &mut self,
+    ) -> Result<
+        (
+            G,
+            HashMap<SignerId, <G as AffineRepr>::ScalarField, RandomState>,
+        ),
+        MuSig2Error,
+    > {
         if self.aggregated_public_key.is_some() {
             // Return cached result if already computed
-            return Ok(self.aggregated_public_key.unwrap());
+            return Ok((
+                self.aggregated_public_key.unwrap(),
+                self.key_aggregation_coeffs.clone(),
+            ));
         }
 
         // Use the standalone function to get both the aggregated key and coefficients
@@ -272,11 +286,27 @@ where
             aggregate_public_keys_with_coeffs(&self.cosigner_public_keys, &self.hash_function)?;
 
         // Store the results in the session
-        self.key_aggregation_coeffs = coeffs;
+        self.key_aggregation_coeffs = coeffs.clone();
         self.aggregated_public_key = Some(agg_key);
         self.state = MuSig2SessionState::KeyAggregated;
 
-        Ok(agg_key)
+        Ok((agg_key, coeffs))
+    }
+
+    pub fn set_aggregated_key(
+        &mut self,
+        agg_key: G,
+        coeffs: HashMap<SignerId, <G as AffineRepr>::ScalarField, RandomState>,
+    ) -> Result<(), MuSig2Error> {
+        if self.aggregated_public_key.is_some() {
+            return Ok(());
+        }
+
+        self.aggregated_public_key = Some(agg_key);
+        self.key_aggregation_coeffs = coeffs;
+        self.state = MuSig2SessionState::KeyAggregated;
+
+        Ok(())
     }
 
     /// Generate the nonces for the local signer
@@ -290,11 +320,6 @@ where
                 "Session must be initialized, have aggregated keys, or have collected nonces"
                     .into(),
             ));
-        }
-
-        // Compute aggregated key if not already done
-        if self.aggregated_public_key.is_none() {
-            let _ = self.compute_aggregated_key()?;
         }
 
         // Generate two random scalar values
@@ -349,7 +374,9 @@ where
     }
 
     /// Compute the aggregated nonce once all nonces are collected
-    pub fn compute_aggregated_nonce(&mut self) -> Result<G, MuSig2Error> {
+    pub fn compute_aggregated_nonce(
+        &mut self,
+    ) -> Result<(G, G::ScalarField, G::ScalarField), MuSig2Error> {
         // Check if we have nonces from all cosigners
         let mut missing_signers = Vec::new();
 
@@ -371,7 +398,7 @@ where
         let mut all_nonce_bytes = Vec::new();
 
         // Get aggregated public key
-        let agg_key = self.compute_aggregated_key()?;
+        let (agg_key, _) = self.compute_aggregated_key()?;
         let mut agg_key_bytes = Vec::new();
         agg_key.serialize_compressed(&mut agg_key_bytes)?;
 
@@ -440,16 +467,37 @@ where
         self.challenge = Some(c);
         self.state = MuSig2SessionState::NonceAggregated;
 
-        Ok(r_agg)
+        Ok((r_agg, c, b))
+    }
+
+    /// Accept already computed aggregated nonce and challenge (only for internal signers)
+    pub fn accept_aggregated_nonce(
+        &mut self,
+        r_agg: G,
+        challenge: G::ScalarField,
+        b: G::ScalarField,
+    ) -> Result<(), MuSig2Error> {
+        // Ensure aggregated key is computed
+        if r_agg.is_zero() {
+            return Err(MuSig2Error::InvalidNonce);
+        }
+
+        // Ensure challenge is valid
+        if challenge.is_zero() {
+            return Err(MuSig2Error::InvalidNonce);
+        }
+
+        // Store in session
+        self.aggregated_nonce = Some(r_agg);
+        self.challenge = Some(challenge);
+        self.nonce_aggregation_coeff = Some(b);
+        self.state = MuSig2SessionState::NonceAggregated;
+
+        Ok(())
     }
 
     /// Creates a partial signature using the local signer's secret key
     pub fn sign(&mut self, secret_key: G::ScalarField) -> Result<G::ScalarField, MuSig2Error> {
-        // Ensure aggregated key is computed
-        if self.aggregated_public_key.is_none() {
-            self.compute_aggregated_key()?;
-        }
-
         // Ensure nonces are generated
         if self.secret_nonces.is_none() {
             return Err(MuSig2Error::InvalidSessionState(
