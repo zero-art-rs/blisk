@@ -197,7 +197,7 @@ impl<G: AffineRepr> PolicyTree<G> {
             .unwrap()
             .iter()
             .map(|child_id| {
-                if let PolicyNode::OrGate(clause_pk) = self
+                match self
                     .tree
                     .get_node_by_id(child_id)
                     .unwrap()
@@ -205,9 +205,11 @@ impl<G: AffineRepr> PolicyTree<G> {
                     .unwrap()
                     .unwrap()
                 {
-                    clause_pk.ok_or(PolicyError::MissingClausePublicKey)
-                } else {
-                    Err(PolicyError::InvalidGate)
+                    PolicyNode::OrGate(clause_pk) => {
+                        clause_pk.ok_or(PolicyError::MissingClausePublicKey)
+                    }
+                    PolicyNode::UserKey((_, pk)) => Ok(pk),
+                    _ => Err(PolicyError::InvalidGate),
                 }
             })
             .collect()
