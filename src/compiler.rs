@@ -11,7 +11,7 @@ use std::result::Result;
 use tree_ds::prelude::*;
 
 impl PolicyExpr {
-    pub(crate) fn generate_random_keys<G: AffineRepr>(
+    pub fn generate_random_keys<G: AffineRepr>(
         &self,
     ) -> Result<HashMap<String, (G::ScalarField, G)>, PolicyError> {
         let mut keys = HashMap::new();
