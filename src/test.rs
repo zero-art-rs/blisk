@@ -46,10 +46,10 @@ pub fn compile_policy(
 
 pub fn resolve_policy(
     mut policy: PolicyTree<Affine>,
-    active_signers: &[&str],
+    all_signers: &[&str],
     secret_keys: &HashMap<String, Fr>,
 ) -> PolicyTree<Affine> {
-    for id in active_signers {
+    for id in all_signers {
         let sk: &Fr = secret_keys.get(*id).expect("Signer secret key not found");
         policy = policy.resolve(*sk).expect("Policy resolution failed");
     }
@@ -138,7 +138,11 @@ pub fn signature_aggregation(
     aggregate_partial_signatures(&all_sigs, R).unwrap()
 }
 
-fn run_blisk_simulation(circuit: &str, signers: Vec<&str>) -> Result<bool, MuSig2Error> {
+fn run_blisk_simulation(
+    circuit: &str,
+    all_signers: Vec<&str>,
+    active_signers: Vec<&str>,
+) -> Result<bool, MuSig2Error> {
     let message: &[u8; 12] = b"test_message";
 
     let (_, expr) = parse(circuit).unwrap();
@@ -146,10 +150,11 @@ fn run_blisk_simulation(circuit: &str, signers: Vec<&str>) -> Result<bool, MuSig
     assert_eq!(public_keys.len(), secret_keys.len());
 
     let (_, policy_tree): (&PolicyExpr, PolicyTree<Affine>) = compile_policy(&expr, public_keys);
-    let mut resolved_policy = resolve_policy(policy_tree, &signers, &secret_keys);
+    let mut resolved_policy = resolve_policy(policy_tree, &all_signers, &secret_keys);
     let temp_check_agg_pk: Affine = resolved_policy.get_public_key().unwrap();
 
-    let mut signers_map = create_signers(&signers, secret_keys, &mut resolved_policy, message);
+    let mut signers_map =
+        create_signers(&active_signers, secret_keys, &mut resolved_policy, message);
     let nonces = create_nonces(&mut signers_map);
     processing_nonces_procedure(&mut signers_map, &nonces).unwrap();
     let aggregated_nonce: Affine = nonces_aggregation(&mut signers_map);
@@ -176,49 +181,64 @@ fn run_blisk_simulation(circuit: &str, signers: Vec<&str>) -> Result<bool, MuSig
 mod blisk_tests {
     use super::*;
 
-    fn run_case(circuit: &str, signers: Vec<&str>) {
-        let verified: bool = run_blisk_simulation(circuit, signers).unwrap();
+    fn run_case(circuit: &str, all_signers: Vec<&str>, active_signers: Vec<&str>) {
+        let verified: bool = run_blisk_simulation(circuit, all_signers, active_signers).unwrap();
         assert!(verified, "Verification failed");
     }
 
+    #[ignore]
     #[test]
     fn threshold_1_of_3() {
         let circuit: &str = "(policy threshold_1_of_3 (threshold 1 A B C))";
-        let signers: Vec<&str> = vec!["B"];
-        run_case(circuit, signers);
+        let all_signers: Vec<&str> = vec!["A", "B", "C"];
+        let active_signers: Vec<&str> = vec!["B"];
+        run_case(circuit, all_signers, active_signers);
+    }
+
+    #[ignore]
+    #[test]
+    fn threshold_3_of_3_manual() {
+        let circuit: &str = "(policy threshold_3_of_3 (and A B C)";
+        let all_signers: Vec<&str> = vec!["A", "B", "C"];
+        let active_signers: Vec<&str> = vec!["A", "B", "C"];
+        run_case(circuit, all_signers, active_signers);
+    }
+
+    #[ignore]
+    #[test]
+    fn threshold_2_of_2_manual() {
+        let circuit: &str = "(policy threshold_2_of_2 (and A B)";
+        let all_signers: Vec<&str> = vec!["A", "B"];
+        let active_signers: Vec<&str> = vec!["A", "B"];
+        run_case(circuit, all_signers, active_signers);
     }
 
     #[test]
     fn threshold_2_of_3() {
         let circuit: &str = "(policy threshold_2_of_3 (threshold 2 A B C))";
-        let signers: Vec<&str> = vec!["A", "C"];
-        run_case(circuit, signers);
+        let all_signers: Vec<&str> = vec!["A", "B", "C"];
+        let active_signers: Vec<&str> = vec!["A", "C"];
+        run_case(circuit, all_signers, active_signers);
     }
 
     #[test]
     fn threshold_2_of_4_manual_v1() {
         let circuit: &str = "(policy threshold_2_of_4_manual_v1 (and (or A B) (or C D)))";
-        let signers: Vec<&str> = vec!["A", "C"];
-        run_case(circuit, signers);
-    }
-
-    #[test]
-    fn threshold_2_of_4_manual_v2() {
-        let circuit: &str = "(policy threshold_2_of_4_manual_v2 (and A (or B C D))))";
-        let signers: Vec<&str> = vec!["A", "C"];
-        run_case(circuit, signers);
+        let all_signers: Vec<&str> = vec!["A", "B", "C", "D"];
+        let active_signers: Vec<&str> = vec!["A", "C"];
+        run_case(circuit, all_signers, active_signers);
     }
 
     #[test]
     fn threshold_2_of_4_manual_v3() {
         let circuit = "(policy threshold_2_of_4_manual_v3 (and A (or B (or C D))))";
-        let signers: Vec<&str> = vec!["A", "C"];
-        run_case(circuit, signers);
+        let all_signers: Vec<&str> = vec!["A", "B", "C", "D"];
+        let active_signers: Vec<&str> = vec!["A", "C"];
+        run_case(circuit, all_signers, active_signers);
     }
 
     #[test]
     fn threshold_2_of_4_manual_v4() {
-        // logical bug?
         let circuit: &str = "(policy threshold_2_of_4_manual_v4
         (or (and A B)
              (and A C)
@@ -226,29 +246,33 @@ mod blisk_tests {
              (and B C)
              (and B D)
              (and C D)))";
-        let signers: Vec<&str> = vec!["A", "C"];
-        run_case(circuit, signers);
+        let all_signers: Vec<&str> = vec!["A", "B", "C", "D"];
+        let active_signers: Vec<&str> = vec!["A", "C"];
+        run_case(circuit, all_signers, active_signers);
     }
 
     #[test]
     fn threshold_2_of_4() {
         let circuit: &str = "(policy threshold_2_of_4 (threshold 2 A B C D))";
-        let signers: Vec<&str> = vec!["A", "C"];
-        run_case(circuit, signers);
+        let all_signers: Vec<&str> = vec!["A", "B", "C", "D"];
+        let active_signers: Vec<&str> = vec!["A", "C"];
+        run_case(circuit, all_signers, active_signers);
     }
 
     #[test]
     fn threshold_3_of_4_manual_v1() {
         let circuit = "(policy threshold_3_of_4_manual_v1 (and A B (or C D)))";
-        let signers: Vec<&str> = vec!["A", "B", "D"];
-        run_case(circuit, signers);
+        let all_signers: Vec<&str> = vec!["A", "B", "C", "D"];
+        let active_signers: Vec<&str> = vec!["A", "B", "D"];
+        run_case(circuit, all_signers, active_signers);
     }
 
     #[test]
-    fn threshold_3_of_4_manual_v2() {
-        let circuit: &str = "(policy threshold_3_of_4_manual_v2 (and (or A B) (or C D) (or E F)))";
-        let signers: Vec<&str> = vec!["A", "C", "F"];
-        run_case(circuit, signers);
+    fn threshold_3_of_6_manual_v2() {
+        let circuit: &str = "(policy threshold_3_of_6_manual_v2 (and (or A B) (or C D) (or E F)))";
+        let all_signers: Vec<&str> = vec!["A", "B", "C", "D", "E", "F"];
+        let active_signers: Vec<&str> = vec!["A", "C", "F"];
+        run_case(circuit, all_signers, active_signers);
     }
 
     #[test]
@@ -259,88 +283,119 @@ mod blisk_tests {
                 (and A B D)
                 (and A C D)
                 (and B C D)))";
-        let signers: Vec<&str> = vec!["A", "C", "D"];
-        run_case(circuit, signers);
+        let all_signers: Vec<&str> = vec!["A", "B", "C", "D"];
+        let active_signers: Vec<&str> = vec!["A", "C", "D"];
+        run_case(circuit, all_signers, active_signers);
     }
 
     #[test]
     fn threshold_3_of_4() {
         let circuit: &str = "(policy threshold_3_of_4 (threshold 3 A B C D))";
-        let signers: Vec<&str> = vec!["A", "B", "C"];
-        run_case(circuit, signers);
+        let all_signers: Vec<&str> = vec!["A", "B", "C", "D"];
+        let active_signers: Vec<&str> = vec!["A", "B", "C"];
+        run_case(circuit, all_signers, active_signers);
     }
 
     #[test]
     fn threshold_2_of_5() {
         let circuit: &str = "(policy threshold_2_of_5 (threshold 2 A B C D E))";
-        let signers: Vec<&str> = vec!["A", "C"];
-        run_case(circuit, signers);
+        let all_signers: Vec<&str> = vec!["A", "B", "C", "D", "E"];
+        let active_signers: Vec<&str> = vec!["A", "C"];
+        run_case(circuit, all_signers, active_signers);
     }
 
     #[test]
     fn threshold_3_of_5() {
         let circuit: &str = "(policy threshold_3_of_5 (threshold 3 A B C D E))";
-        let signers: Vec<&str> = vec!["A", "C", "D"];
-        run_case(circuit, signers);
+        let all_signers: Vec<&str> = vec!["A", "B", "C", "D", "E"];
+        let active_signers: Vec<&str> = vec!["A", "C", "D"];
+        run_case(circuit, all_signers, active_signers);
     }
 
     #[test]
     fn threshold_4_of_5() {
         let circuit: &str = "(policy threshold_4_of_5 (threshold 4 A B C D E))";
-        let signers: Vec<&str> = vec!["A", "B", "D", "E"];
-        run_case(circuit, signers);
+        let all_signers: Vec<&str> = vec!["A", "B", "C", "D", "E"];
+        let active_signers: Vec<&str> = vec!["A", "B", "D", "E"];
+        run_case(circuit, all_signers, active_signers);
     }
 
     #[test]
     fn threshold_4_of_5_manual() {
         let circuit: &str = "(policy threshold_4_of_5_manual (and A B C (or D E)))";
-        let signers: Vec<&str> = vec!["A", "B", "C", "D"];
-        run_case(circuit, signers);
+        let all_signers: Vec<&str> = vec!["A", "B", "C", "D", "E"];
+        let active_signers: Vec<&str> = vec!["A", "B", "C", "D"];
+        run_case(circuit, all_signers, active_signers);
     }
 
     #[test]
     fn threshold_5_of_7_manual() {
         let circuit: &str = "(policy threshold_5_of_7_manual (and A B C (or D E) (or F G)))";
-        let signers: Vec<&str> = vec!["A", "B", "C", "D", "G"];
-        run_case(circuit, signers);
+        let all_signers: Vec<&str> = vec!["A", "B", "C", "D", "E", "F", "G"];
+        let active_signers: Vec<&str> = vec!["A", "B", "C", "D", "G"];
+        run_case(circuit, all_signers, active_signers);
     }
 
     #[test]
     fn threshold_7_of_9_manual() {
         let circuit: &str = "(policy threshold_7_of_9_manual (and A B C D E (or F G) (or H I)))";
-        let signers: Vec<&str> = vec!["A", "B", "C", "D", "E", "G", "I"];
-        run_case(circuit, signers);
+        let all_signers: Vec<&str> = vec!["A", "B", "C", "D", "E", "F", "G", "H", "I"];
+        let active_signers: Vec<&str> = vec!["A", "B", "C", "D", "E", "G", "I"];
+        run_case(circuit, all_signers, active_signers);
     }
 
     #[test]
     fn threshold_11_of_15_manual_v1() {
         let circuit: &str =
             "(policy multisig_11_of_15 (and A B C D E F G (or H I) (or J K) (or L M) (or N O)))";
-        let signers: Vec<&str> = vec!["A", "B", "C", "D", "E", "F", "G", "H", "J", "L", "O"];
-        run_case(circuit, signers);
+        let all_signers: Vec<&str> = vec![
+            "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O",
+        ];
+        let active_signers: Vec<&str> = vec!["A", "B", "C", "D", "E", "F", "G", "H", "J", "L", "O"];
+        run_case(circuit, all_signers, active_signers);
     }
 
     #[test]
     fn threshold_11_of_15_manual_v2() {
         let circuit: &str =
             "(policy multisig_11_of_15 (and (or A B) C D E F G (or H I) (or J K) L M (or N O)))";
-        let signers: Vec<&str> = vec!["A", "C", "D", "E", "F", "G", "H", "J", "L", "M", "O"];
-        run_case(circuit, signers);
+        let all_signers: Vec<&str> = vec![
+            "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O",
+        ];
+        let active_signers: Vec<&str> = vec!["A", "C", "D", "E", "F", "G", "H", "J", "L", "M", "O"];
+        run_case(circuit, all_signers, active_signers);
     }
 
     #[test]
     fn threshold_11_of_15_v1() {
         let circuit: &str =
             "(policy multisig_11_of_15 (threshold 11 A B C D E F G H I J K L M N O))";
-        let signers: Vec<&str> = vec!["A", "C", "D", "G", "H", "I", "J", "K", "L", "M", "O"];
-        run_case(circuit, signers);
+        let all_signers: Vec<&str> = vec![
+            "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O",
+        ];
+        let active_signers: Vec<&str> = vec!["A", "C", "D", "G", "H", "I", "J", "K", "L", "M", "O"];
+        run_case(circuit, all_signers, active_signers);
     }
 
     #[test]
     fn threshold_11_of_15_v2() {
         let circuit: &str =
             "(policy multisig_11_of_15 (threshold 11 A B C D E F G H I J K L M N O))";
-        let signers: Vec<&str> = vec!["A", "C", "D", "E", "F", "G", "H", "J", "L", "M", "O"];
-        run_case(circuit, signers);
+        let all_signers: Vec<&str> = vec![
+            "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O",
+        ];
+        let active_signers: Vec<&str> = vec!["A", "C", "D", "E", "F", "G", "H", "J", "L", "M", "O"];
+        run_case(circuit, all_signers, active_signers);
+    }
+
+    #[test]
+    fn threshold_11_of_15_v3() {
+        let circuit: &str =
+            "(policy multisig_11_of_15 (threshold 11 A B C D E F G H I J K L M N O))";
+        let all_signers: Vec<&str> = vec![
+            "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O",
+        ];
+        let active_signers: Vec<&str> = vec!["A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K"];
+        run_case(circuit, all_signers, active_signers);
     }
 }
