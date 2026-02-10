@@ -5,3 +5,4 @@ pub mod musig2;
 pub mod parser;
 pub mod policy;
 pub mod signer;
+mod test;
